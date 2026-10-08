@@ -43,6 +43,19 @@ jobs:
           open(p, 'w', encoding='utf-8').write(s)
           PY
 
+      - name: Force compileSdk 36 for plugins
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/fix-compilesdk.gradle <<'EOF'
+          allprojects {
+            afterEvaluate { p ->
+              if (p.plugins.hasPlugin('com.android.library')) {
+                p.android.compileSdkVersion 36
+              }
+            }
+          }
+          EOF
+
       - run: flutter pub get
       - run: flutter build apk --release
 
