@@ -44,7 +44,7 @@ String statusLabel(String s) => switch (s) {
 String paymentLabel(String m) => switch (m) {
       'cod' => 'عند الاستلام',
       'partial' => 'دفعة مقدمة + الباقي عند الاستلام',
-      _ => 'مدفوع بالكامل / محاسب',
+      _ => 'مدفوع بالكامل (شامل التوصيل)',
     };
 
 // ====================================================================
@@ -330,8 +330,9 @@ class Order {
   });
 
   /// المبلغ المطلوب تحصيله من العميل عند الاستلام (متبقي الأصناف + التوصيل)
-  double get customerDue => goodsDue + delivery;
-  double get paidAmount => method == 'prepaid' ? goodsTotal : paidNow;
+  /// المحاسَب بالكامل = الأصناف + التوصيل مدفوعان، فلا يُطلب من العميل شيء
+  double get customerDue => method == 'prepaid' ? 0 : goodsDue + delivery;
+  double get paidAmount => method == 'prepaid' ? total : paidNow;
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -1201,6 +1202,7 @@ class AppStore extends ChangeNotifier {
       goodsTotal: goods,
       paidNow: paid,
       goodsDue: due,
+      captainCredit: method == 'prepaid' ? delivery : 0,
       notes: notes,
       method: method,
     );
@@ -1258,11 +1260,15 @@ String _itemsText(Order o) =>
 String invoiceText(AppStore s, Order o) {
   final c = s.customer(o.customerId);
   final cap = s.captain(o.captainId);
-  final pay = o.method == 'prepaid'
-      ? 'قيمة الأصناف مدفوعة، والتوصيل عند الاستلام'
+  final full = o.method == 'prepaid';
+  final pay = full
+      ? 'تم الدفع بالكامل (الأصناف + التوصيل) ✅'
       : o.method == 'partial'
           ? 'مدفوع جزئياً'
           : 'الدفع عند الاستلام';
+  final dueLine = o.customerDue <= 0
+      ? 'المطلوب عند الاستلام: لا يوجد — طلبك مدفوع بالكامل ✅\n'
+      : 'المطلوب عند الاستلام (شامل التوصيل): ${money(o.customerDue)}\n';
   return 'مرحباً ${c?.name ?? ''} 🌿\n'
       'فاتورة طلبك من ${s.settings.storeName} رقم #${o.id}\n'
       '──────────────\n'
@@ -1274,7 +1280,7 @@ String invoiceText(AppStore s, Order o) {
       'الإجمالي شامل التوصيل: ${money(o.total)}\n'
       'حالة الدفع: $pay\n'
       'المبلغ المدفوع: ${money(o.paidAmount)}\n'
-      'المطلوب عند الاستلام: ${money(o.customerDue)}\n'
+      '$dueLine'
       'الكابتن: ${cap?.name ?? '-'} (${cap?.phone ?? '-'})\n'
       'العنوان: ${c?.address ?? '-'}\n'
       '${s.settings.storePhone.isEmpty ? '' : 'للتواصل: ${s.settings.storePhone}\n'}'
@@ -1283,6 +1289,13 @@ String invoiceText(AppStore s, Order o) {
 
 String captainText(AppStore s, Order o) {
   final c = s.customer(o.customerId);
+  final collect = o.method == 'prepaid'
+      ? '✅ الطلب مدفوع بالكامل (الأصناف + التوصيل)\n'
+          'لا تحصّل أي مبلغ من العميل.\n'
+          'أجرة توصيلك: ${money(o.delivery)} (تُقيَّد لك على المحل)\n'
+      : 'المطلوب تحصيله من العميل: ${money(o.customerDue)}\n'
+          'المطلوب توريده للمحل: ${money(o.goodsDue)}\n'
+          'أجرة توصيلك: ${money(o.delivery)} (تبقى معك من المبلغ المحصّل)\n';
   return '🏍️ تكليف توصيل من ${s.settings.storeName}\n'
       'الطلب #${o.id}\n'
       '──────────────\n'
@@ -1292,8 +1305,7 @@ String captainText(AppStore s, Order o) {
       'هاتف العميل: ${c?.phone ?? '-'}\n'
       'العنوان: ${c?.address ?? '-'}\n'
       'طريقة الدفع: ${paymentLabel(o.method)}\n'
-      'المطلوب تحصيله من العميل (شامل التوصيل): ${money(o.customerDue)}\n'
-      'رسوم التوصيل: ${money(o.delivery)}\n'
+      '$collect'
       'ملاحظات: ${o.notes.isEmpty ? 'لا توجد' : o.notes}\n'
       'نتمنى لك توصيلاً موفقاً 🙏';
 }
@@ -1302,7 +1314,8 @@ String _statement(AppStore s, Captain c) {
   final b = s.balances(c.id);
   return 'كشف حساب الكابتن ${c.name} — ${s.settings.storeName}\n'
       'المطلوب توريده للمحل: ${money(b.cashDue)}\n'
-      'يرجى التسوية في أقرب وقت. شكراً لجهودك 🙏';
+      'مستحق لك عند المحل (أجرة التوصيل): ${money(b.creditDue)}\n'
+      'شكراً لجهودك 🙏';
 }
 
 // ====================================================================
@@ -1682,7 +1695,7 @@ class _OrderFormPageState extends State<OrderFormPage> {
     final note = switch (method) {
       'cod' => 'المطلوب من العميل عند التسليم: ${money(goods + del)} (الأصناف ${money(goods)} + التوصيل ${money(del)})',
       'partial' => 'المدفوع الآن: ${money(paidV)} — المتبقي عند التسليم شامل التوصيل: ${money(goods - paidV + del)}',
-      _ => 'قيمة الأصناف مدفوعة، ويُحصّل عند التسليم رسوم التوصيل: ${money(del)}',
+      _ => 'الطلب مدفوع بالكامل شامل التوصيل (${money(goods + del)}). لا يُحصَّل شيء من العميل، وتُقيَّد أجرة التوصيل ${money(del)} للكابتن على المحل',
     };
 
     return Scaffold(
@@ -2254,12 +2267,11 @@ class InvoiceCard extends StatelessWidget {
                 gradient: const LinearGradient(colors: [Color(0xFFF4F9EF), Colors.white, Color(0xFFF9F6E9)]),
                 borderColor: const Color(0xFFD9E5C7),
                 child: Column(children: [
-                  Text(due == 0 ? 'لا يوجد مبلغ مطلوب استلامه' : 'المبلغ المتبقي عند الاستلام', style: const TextStyle(fontWeight: FontWeight.w900, color: C.g, fontSize: 13)),
+                  Text(due == 0 ? 'الطلب مدفوع بالكامل — لا يوجد مبلغ مطلوب' : 'المبلغ المتبقي عند الاستلام', style: const TextStyle(fontWeight: FontWeight.w900, color: C.g, fontSize: 13)),
                   const SizedBox(height: 4),
                   FittedBox(fit: BoxFit.scaleDown, child: Text(money(due), style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w900, color: Color(0xFF174B38)))),
-                  if (due != 0)
-                    Text(o.method == 'prepaid' ? 'قيمة الأصناف مدفوعة؛ رسوم التوصيل تُحصّل عند التسليم' : 'يشمل المبلغ المتبقي رسوم التوصيل',
-                        textAlign: TextAlign.center, style: const TextStyle(fontSize: 10, color: C.muted)),
+                  Text(due == 0 ? 'شامل قيمة الأصناف ورسوم التوصيل' : 'يشمل المبلغ المتبقي رسوم التوصيل',
+                      textAlign: TextAlign.center, style: const TextStyle(fontSize: 10, color: C.muted)),
                 ]),
               ),
             ),
@@ -2705,9 +2717,11 @@ class CaptainsPage extends StatelessWidget {
         ]),
         const SizedBox(height: 8),
         Row(children: [
-          Expanded(child: _box('مطلوب منه للمحل', money(b.cashDue), b.cashDue > 0 ? C.red : C.g2)),
-          const SizedBox(width: 8),
-          Expanded(child: _box('عدد الطلبات', '$n', C.blue)),
+          Expanded(child: _box('عليه للمحل', money(b.cashDue), b.cashDue > 0 ? C.red : C.g2)),
+          const SizedBox(width: 6),
+          Expanded(child: _box('له عند المحل', money(b.creditDue), b.creditDue > 0 ? C.purple : C.g2)),
+          const SizedBox(width: 6),
+          Expanded(child: _box('الطلبات', '$n', C.blue)),
         ]),
         const Divider(height: 18),
         Wrap(children: [
@@ -2771,6 +2785,8 @@ class CaptainLedgerPage extends StatelessWidget {
     final b = s.balances(captainId);
     final orders = s.orders.where((o) => o.captainId == captainId && o.status != 'cancel' && o.goodsDue > 0).toList()
       ..sort((a, b) => b.date.compareTo(a.date));
+    final creditOrders = s.orders.where((o) => o.captainId == captainId && o.status != 'cancel' && o.captainCredit > 0).toList()
+      ..sort((a, b) => b.date.compareTo(a.date));
     final sets = s.settlements.where((x) => x.captainId == captainId).toList()..sort((a, b) => b.date.compareTo(a.date));
 
     return Scaffold(
@@ -2791,12 +2807,50 @@ class CaptainLedgerPage extends StatelessWidget {
                   style: FilledButton.styleFrom(backgroundColor: C.gold, foregroundColor: C.dark),
                   onPressed: b.cashDue <= 0 ? null : () => _settle(context, c, b.cashDue),
                   icon: const Icon(Icons.payments_rounded),
-                  label: const Text('تسجيل تسوية'),
+                  label: const Text('تسجيل توريد من الكابتن'),
+                ),
+              ]),
+            ),
+            const SizedBox(height: 12),
+            Container(
+              padding: const EdgeInsets.all(18),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(color: C.purple.withOpacity(.45), width: 1.5),
+                boxShadow: [BoxShadow(color: C.purple.withOpacity(.08), blurRadius: 18, offset: const Offset(0, 8))],
+              ),
+              child: Column(children: [
+                const Text('مستحق للكابتن عند المحل (أجرة توصيل الطلبات المدفوعة)', textAlign: TextAlign.center, style: TextStyle(color: C.muted, fontWeight: FontWeight.w800, fontSize: 12)),
+                const SizedBox(height: 4),
+                Text(money(b.creditDue), style: const TextStyle(color: C.purple, fontSize: 26, fontWeight: FontWeight.w900)),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(backgroundColor: C.purple, foregroundColor: Colors.white),
+                  onPressed: b.creditDue <= 0 ? null : () => _settle(context, c, b.creditDue, type: 'owner_paid'),
+                  icon: const Icon(Icons.payments_rounded),
+                  label: const Text('تسجيل دفع للكابتن'),
                 ),
               ]),
             ),
             const SizedBox(height: 16),
-            const PageHead('طلبات عليها مبالغ'),
+            const PageHead('أجرة توصيل مستحقة للكابتن'),
+            if (creditOrders.isEmpty) const Empty('لا توجد أجور توصيل مقيّدة', icon: Icons.verified_rounded),
+            for (final o in creditOrders)
+              LuxCard(
+                accent: C.purple,
+                child: Row(children: [
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text('#${o.id} — ${s.customer(o.customerId)?.name ?? '-'}', style: const TextStyle(fontWeight: FontWeight.w900)),
+                      Text('${dateText(o.date)} • طلب مدفوع بالكامل', style: const TextStyle(color: C.muted, fontSize: 11)),
+                    ]),
+                  ),
+                  Text(money(o.captainCredit), style: const TextStyle(color: C.purple, fontWeight: FontWeight.w900)),
+                ]),
+              ),
+            const SizedBox(height: 8),
+            const PageHead('طلبات عليها مبالغ للمحل'),
             if (orders.isEmpty) const Empty('لا توجد مبالغ مستحقة', icon: Icons.verified_rounded),
             for (final o in orders)
               LuxCard(
@@ -2835,16 +2889,16 @@ class CaptainLedgerPage extends StatelessWidget {
     );
   }
 
-  Future<void> _settle(BuildContext context, Captain c, double max) async {
+  Future<void> _settle(BuildContext context, Captain c, double max, {String type = 'captain_paid'}) async {
     final amount = TextEditingController(text: max.toStringAsFixed(max == max.roundToDouble() ? 0 : 2));
     final note = TextEditingController();
     await showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
-        title: Text('تسوية مع ${c.name}'),
+        title: Text(type == 'captain_paid' ? 'توريد من ${c.name} للمحل' : 'دفع أجرة توصيل لـ ${c.name}'),
         content: Column(mainAxisSize: MainAxisSize.min, children: [
-          TextField(controller: amount, keyboardType: numType, decoration: const InputDecoration(labelText: 'المبلغ المسدّد')),
+          TextField(controller: amount, keyboardType: numType, decoration: InputDecoration(labelText: type == 'captain_paid' ? 'المبلغ المورَّد' : 'المبلغ المدفوع للكابتن')),
           const SizedBox(height: 10),
           TextField(controller: note, decoration: const InputDecoration(labelText: 'ملاحظة (اختياري)')),
         ]),
@@ -2852,7 +2906,7 @@ class CaptainLedgerPage extends StatelessWidget {
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
           FilledButton(
             onPressed: () {
-              final err = context.read<AppStore>().addSettlement(c.id, 'captain_paid', num2(amount.text), note.text.trim());
+              final err = context.read<AppStore>().addSettlement(c.id, type, num2(amount.text), note.text.trim());
               if (err != null) {
                 toast(context, err);
               } else {
