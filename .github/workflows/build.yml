@@ -43,10 +43,53 @@ jobs:
           open(p, 'w', encoding='utf-8').write(s)
           PY
 
+      - name: Sign with permanent key
+        run: |
+          test -f salad_bar.jks || (echo "ملف salad_bar.jks غير موجود في المستودع" && exit 1)
+          cp salad_bar.jks android/app/salad_bar.jks
+          python3 - <<'PY'
+          import os, re
+          PW = 'RMa8w6CCvkhA0KSlYs'
+          kts = 'android/app/build.gradle.kts'
+          gr = 'android/app/build.gradle'
+          if os.path.exists(kts):
+              p = kts
+              s = open(p, encoding='utf-8').read()
+              block = '''signingConfigs {
+                  create("release") {
+                      storeFile = file("salad_bar.jks")
+                      storePassword = "''' + PW + '''"
+                      keyAlias = "saladbar"
+                      keyPassword = "''' + PW + '''"
+                  }
+              }
+              buildTypes {'''
+              s = s.replace('buildTypes {', block, 1)
+              s, n = re.subn(r'signingConfig\s*=\s*signingConfigs\.getByName\("debug"\)', 'signingConfig = signingConfigs.getByName("release")', s)
+          else:
+              p = gr
+              s = open(p, encoding='utf-8').read()
+              block = '''signingConfigs {
+                  release {
+                      storeFile file("salad_bar.jks")
+                      storePassword "''' + PW + '''"
+                      keyAlias "saladbar"
+                      keyPassword "''' + PW + '''"
+                  }
+              }
+              buildTypes {'''
+              s = s.replace('buildTypes {', block, 1)
+              s, n = re.subn(r'signingConfig\s+signingConfigs\.debug', 'signingConfig signingConfigs.release', s)
+          if n == 0:
+              raise SystemExit('تعذر ضبط التوقيع في ' + p)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('signing patched in', p)
+          PY
+
       - name: Force compileSdk 36 for plugins
         run: |
           mkdir -p ~/.gradle/init.d
-          cat > ~/.gradle/init.d/fix-compilesdk.gradle <<'EOF'
+          cat > ~/.gradle/init.d/fix-compilesdk.gradle <<'GR'
           allprojects {
             afterEvaluate { p ->
               if (p.plugins.hasPlugin('com.android.library')) {
@@ -54,10 +97,10 @@ jobs:
               }
             }
           }
-          EOF
+          GR
 
       - run: flutter pub get
-      - run: flutter build apk --release
+      - run: flutter build apk --release --build-number=${{ github.run_number }} --build-name=1.0.${{ github.run_number }}
 
       - uses: actions/upload-artifact@v4
         with:
