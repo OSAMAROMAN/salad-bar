@@ -390,9 +390,51 @@ class Settlement {
       );
 }
 
+/// مشتريات خارجية يكلّف بها المحل الكابتن (يسلّمه عهدة ثم يسجّل التكلفة الفعلية)
+class Purchase {
+  int id, captainId;
+  String title, note;
+  double given, actual;
+  bool closed;
+  DateTime date;
+  Purchase({
+    required this.id,
+    required this.captainId,
+    required this.title,
+    required this.given,
+    this.actual = 0,
+    this.note = '',
+    this.closed = false,
+    required this.date,
+  });
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'captainId': captainId,
+        'title': title,
+        'note': note,
+        'given': given,
+        'actual': actual,
+        'closed': closed,
+        'date': date.toIso8601String(),
+      };
+  factory Purchase.fromJson(Map<String, dynamic> j) => Purchase(
+        id: j['id'],
+        captainId: j['captainId'],
+        title: j['title'] ?? '',
+        note: j['note'] ?? '',
+        given: _d(j['given']),
+        actual: _d(j['actual']),
+        closed: j['closed'] ?? false,
+        date: DateTime.parse(j['date']),
+      );
+}
+
 class Balances {
   final double cashDue, creditDue;
   const Balances(this.cashDue, this.creditDue);
+
+  /// موجب = للكابتن على المحل، سالب = على الكابتن للمحل
+  double get net => creditDue - cashDue;
 }
 
 // ====================================================================
@@ -924,6 +966,8 @@ class AppStore extends ChangeNotifier {
   List<Captain> captains = [];
   List<Order> orders = [];
   List<Settlement> settlements = [];
+  List<Purchase> purchases = [];
+  bool _captainsFixed = false;
   int _nP = 1, _nC = 1, _nCap = 1, _nO = 1;
 
   void init(String? raw) {
@@ -932,6 +976,7 @@ class AppStore extends ChangeNotifier {
       try {
         _load(jsonDecode(raw) as Map<String, dynamic>);
         ok = true;
+        _persist(jsonEncode(toJson()));
       } catch (_) {}
     }
     if (!ok) _seed();
@@ -959,13 +1004,14 @@ class AppStore extends ChangeNotifier {
       Customer(id: 1, name: 'عميل تجريبي', phone: '967700000000', address: 'صنعاء', notes: 'يفضل الاتصال قبل التوصيل'),
     ];
     captains = [
-      Captain(id: 1, name: 'كابتن محمد', phone: '967733333333'),
-      Captain(id: 2, name: 'كابتن أحمد', phone: '967744444444'),
+      Captain(id: 1, name: 'كابتن أسامة وهان', phone: '967783182367'),
     ];
     orders = [];
     settlements = [];
+    purchases = [];
+    _captainsFixed = true;
     _nC = 2;
-    _nCap = 3;
+    _nCap = 2;
     _nO = 1;
   }
 
@@ -976,10 +1022,29 @@ class AppStore extends ChangeNotifier {
     captains = (j['captains'] as List).map((e) => Captain.fromJson(Map<String, dynamic>.from(e))).toList();
     orders = (j['orders'] as List).map((e) => Order.fromJson(Map<String, dynamic>.from(e))).toList();
     settlements = ((j['settlements'] ?? []) as List).map((e) => Settlement.fromJson(Map<String, dynamic>.from(e))).toList();
+    purchases = ((j['purchases'] ?? []) as List).map((e) => Purchase.fromJson(Map<String, dynamic>.from(e))).toList();
     _nP = (products.map((e) => e.id).fold(0, max)) + 1;
     _nC = (customers.map((e) => e.id).fold(0, max)) + 1;
     _nCap = (captains.map((e) => e.id).fold(0, max)) + 1;
     _nO = (orders.map((e) => e.id).fold(0, max)) + 1;
+    _captainsFixed = j['captainsFixV1'] == true;
+    if (!_captainsFixed) {
+      _fixCaptains();
+      _captainsFixed = true;
+    }
+  }
+
+  /// مرة واحدة: حذف الكباتن الافتراضيين القدامى (إن لم يكن لهم حركة) وإضافة الكابتن أسامة وهان
+  void _fixCaptains() {
+    const oldPhones = {'967733333333', '967744444444'};
+    captains.removeWhere((c) =>
+        oldPhones.contains(c.phone) &&
+        !orders.any((o) => o.captainId == c.id) &&
+        !settlements.any((x) => x.captainId == c.id) &&
+        !purchases.any((x) => x.captainId == c.id));
+    if (!captains.any((c) => waNumber(c.phone) == '967783182367')) {
+      captains.add(Captain(id: _nCap++, name: 'كابتن أسامة وهان', phone: '967783182367'));
+    }
   }
 
   Map<String, dynamic> toJson() => {
@@ -989,6 +1054,8 @@ class AppStore extends ChangeNotifier {
         'captains': captains.map((e) => e.toJson()).toList(),
         'orders': orders.map((e) => e.toJson()).toList(),
         'settlements': settlements.map((e) => e.toJson()).toList(),
+        'purchases': purchases.map((e) => e.toJson()).toList(),
+        'captainsFixV1': _captainsFixed,
       };
 
   void _save() {
@@ -1132,8 +1199,22 @@ class AppStore extends ChangeNotifier {
     if (orders.any((o) => o.captainId == id && o.status != 'cancel')) return 'لا يمكن حذف كابتن لديه طلبات غير ملغاة';
     captains.removeWhere((x) => x.id == id);
     settlements.removeWhere((x) => x.captainId == id);
+    purchases.removeWhere((x) => x.captainId == id);
     _save();
     return null;
+  }
+
+  void savePurchase(Purchase p) {
+    if (p.id == 0) {
+      p.id = DateTime.now().millisecondsSinceEpoch;
+      purchases.add(p);
+    }
+    _save();
+  }
+
+  void deletePurchase(int id) {
+    purchases.removeWhere((x) => x.id == id);
+    _save();
   }
 
   Balances balances(int captainId) {
@@ -1142,6 +1223,16 @@ class AppStore extends ChangeNotifier {
       if (o.captainId == captainId && o.status != 'cancel') {
         cash += o.goodsDue;
         credit += o.captainCredit;
+      }
+    }
+    for (final pr in purchases) {
+      if (pr.captainId != captainId) continue;
+      if (!pr.closed) {
+        cash += pr.given; // عهدة بيد الكابتن لم تُسجَّل تكلفتها بعد
+      } else if (pr.actual > pr.given) {
+        credit += pr.actual - pr.given; // زيادة دفعها الكابتن من جيبه
+      } else {
+        cash += pr.given - pr.actual; // متبقٍّ يعيده للمحل
       }
     }
     double paidBy = 0, paidTo = 0;
@@ -1312,9 +1403,21 @@ String captainText(AppStore s, Order o) {
 
 String _statement(AppStore s, Captain c) {
   final b = s.balances(c.id);
+  final ps = s.purchases.where((p) => p.captainId == c.id).toList()..sort((x, y) => x.date.compareTo(y.date));
+  final lines = ps.map((p) {
+    if (!p.closed) return '• ${p.title}: سُلّم ${money(p.given)} — قيد التنفيذ';
+    final d = p.actual - p.given;
+    final res = d > 0 ? 'لك ${money(d)}' : d < 0 ? 'عليك ${money(-d)}' : 'مطابق';
+    return '• ${p.title}: سُلّم ${money(p.given)} — الفعلي ${money(p.actual)} — $res';
+  }).join('\n');
+  final net = b.net;
   return 'كشف حساب الكابتن ${c.name} — ${s.settings.storeName}\n'
-      'المطلوب توريده للمحل: ${money(b.cashDue)}\n'
-      'مستحق لك عند المحل (أجرة التوصيل): ${money(b.creditDue)}\n'
+      '──────────────\n'
+      'عليك للمحل (توريد/عهدة): ${money(b.cashDue)}\n'
+      'لك عند المحل (توصيل + مشتريات): ${money(b.creditDue)}\n'
+      '${ps.isEmpty ? '' : 'المشتريات الخارجية:\n$lines\n'}'
+      '──────────────\n'
+      '${net > 0 ? 'الصافي: لك على المحل ${money(net)}' : net < 0 ? 'الصافي: عليك للمحل ${money(-net)}' : 'الحساب متساوٍ ✅'}\n'
       'شكراً لجهودك 🙏';
 }
 
@@ -2788,6 +2891,7 @@ class CaptainLedgerPage extends StatelessWidget {
     final creditOrders = s.orders.where((o) => o.captainId == captainId && o.status != 'cancel' && o.captainCredit > 0).toList()
       ..sort((a, b) => b.date.compareTo(a.date));
     final sets = s.settlements.where((x) => x.captainId == captainId).toList()..sort((a, b) => b.date.compareTo(a.date));
+    final purchases = s.purchases.where((x) => x.captainId == captainId).toList()..sort((a, b) => b.date.compareTo(a.date));
 
     return Scaffold(
       appBar: AppBar(title: Text('حساب ${c.name}'), flexibleSpace: Container(decoration: const BoxDecoration(gradient: C.brandGradient))),
@@ -2821,7 +2925,7 @@ class CaptainLedgerPage extends StatelessWidget {
                 boxShadow: [BoxShadow(color: C.purple.withOpacity(.08), blurRadius: 18, offset: const Offset(0, 8))],
               ),
               child: Column(children: [
-                const Text('مستحق للكابتن عند المحل (أجرة توصيل الطلبات المدفوعة)', textAlign: TextAlign.center, style: TextStyle(color: C.muted, fontWeight: FontWeight.w800, fontSize: 12)),
+                const Text('مستحق للكابتن عند المحل (أجرة توصيل + مشتريات خارجية)', textAlign: TextAlign.center, style: TextStyle(color: C.muted, fontWeight: FontWeight.w800, fontSize: 12)),
                 const SizedBox(height: 4),
                 Text(money(b.creditDue), style: const TextStyle(color: C.purple, fontSize: 26, fontWeight: FontWeight.w900)),
                 const SizedBox(height: 12),
@@ -2833,7 +2937,40 @@ class CaptainLedgerPage extends StatelessWidget {
                 ),
               ]),
             ),
+            const SizedBox(height: 12),
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: (b.net > 0 ? C.purple : b.net < 0 ? C.red : C.g2).withOpacity(.09),
+                borderRadius: BorderRadius.circular(18),
+              ),
+              child: Row(children: [
+                Icon(b.net == 0 ? Icons.verified_rounded : Icons.balance_rounded, color: b.net > 0 ? C.purple : b.net < 0 ? C.red : C.g2),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    b.net > 0 ? 'الصافي: للكابتن على المحل ${money(b.net)}' : b.net < 0 ? 'الصافي: على الكابتن للمحل ${money(-b.net)}' : 'الحساب متساوٍ ✅',
+                    style: const TextStyle(fontWeight: FontWeight.w900),
+                  ),
+                ),
+              ]),
+            ),
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              onPressed: () => sendWa(context, c.phone, _statement(s, c)),
+              icon: const Icon(Icons.chat_rounded, color: C.wa),
+              label: const Text('إرسال كشف الحساب للكابتن (واتساب)'),
+            ),
             const SizedBox(height: 16),
+            PageHead('مشتريات خارجية',
+                trailing: FilledButton.icon(
+                  onPressed: () => showSheet(context, (_) => _PurchaseForm(captainId: captainId)),
+                  icon: const Icon(Icons.add),
+                  label: const Text('إضافة'),
+                )),
+            if (purchases.isEmpty) const Empty('لا توجد مشتريات خارجية', icon: Icons.shopping_bag_outlined),
+            for (final pr in purchases) _purchaseCard(context, pr),
+            const SizedBox(height: 8),
             const PageHead('أجرة توصيل مستحقة للكابتن'),
             if (creditOrders.isEmpty) const Empty('لا توجد أجور توصيل مقيّدة', icon: Icons.verified_rounded),
             for (final o in creditOrders)
@@ -2889,6 +3026,63 @@ class CaptainLedgerPage extends StatelessWidget {
     );
   }
 
+  Widget _kv(String k, String v) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(k, style: const TextStyle(color: C.muted, fontSize: 11)),
+        const SizedBox(height: 2),
+        Text(v, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 14)),
+      ]);
+
+  Widget _purchaseCard(BuildContext context, Purchase p) {
+    final extra = p.actual - p.given;
+    final Color col = !p.closed ? C.orange : extra > 0 ? C.purple : extra < 0 ? C.red : C.g2;
+    final String result = !p.closed
+        ? 'قيد التنفيذ — المبلغ المسلَّم عهدة على الكابتن حتى تسجَّل التكلفة الفعلية'
+        : extra > 0
+            ? 'زيادة دفعها الكابتن من جيبه — تُردّ له: ${money(extra)}'
+            : extra < 0
+                ? 'متبقٍّ يعيده الكابتن للمحل: ${money(-extra)}'
+                : 'المبلغ مطابق، لا فرق';
+    return LuxCard(
+      accent: col,
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Expanded(child: Text(p.title, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 15))),
+          Badge2(p.closed ? 'مغلق' : 'قيد التنفيذ', col),
+        ]),
+        const SizedBox(height: 2),
+        Text(dateText(p.date), style: const TextStyle(color: C.muted, fontSize: 11)),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(child: _kv('سُلّم للكابتن', money(p.given))),
+          Expanded(child: _kv('التكلفة الفعلية', p.closed ? money(p.actual) : '—')),
+        ]),
+        const SizedBox(height: 8),
+        Text(result, style: TextStyle(color: col, fontWeight: FontWeight.w800, fontSize: 12)),
+        if (p.note.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 4), child: Text('ملاحظات: ${p.note}', style: const TextStyle(color: C.muted, fontSize: 11))),
+        const Divider(height: 18),
+        Wrap(children: [
+          TextButton.icon(
+            onPressed: () => showSheet(context, (_) => _PurchaseForm(captainId: p.captainId, purchase: p)),
+            icon: Icon(p.closed ? Icons.edit_outlined : Icons.receipt_long_rounded, size: 18),
+            label: Text(p.closed ? 'تعديل' : 'تسجيل التكلفة الفعلية'),
+          ),
+          TextButton.icon(
+            onPressed: () async {
+              if (await confirmDialog(context, 'حذف هذه المشتريات؟ سيتغيّر رصيد الكابتن.', yes: 'حذف')) {
+                if (context.mounted) {
+                  context.read<AppStore>().deletePurchase(p.id);
+                  toast(context, 'تم الحذف');
+                }
+              }
+            },
+            icon: const Icon(Icons.delete_outline_rounded, size: 18, color: C.red),
+            label: const Text('حذف', style: TextStyle(color: C.red)),
+          ),
+        ]),
+      ]),
+    );
+  }
+
   Future<void> _settle(BuildContext context, Captain c, double max, {String type = 'captain_paid'}) async {
     final amount = TextEditingController(text: max.toStringAsFixed(max == max.roundToDouble() ? 0 : 2));
     final note = TextEditingController();
@@ -2918,6 +3112,70 @@ class CaptainLedgerPage extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _PurchaseForm extends StatefulWidget {
+  final int captainId;
+  final Purchase? purchase;
+  const _PurchaseForm({required this.captainId, this.purchase});
+  @override
+  State<_PurchaseForm> createState() => _PurchaseFormState();
+}
+
+class _PurchaseFormState extends State<_PurchaseForm> {
+  final form = GlobalKey<FormState>();
+  late final title = TextEditingController(text: widget.purchase?.title ?? '');
+  late final given = TextEditingController(text: widget.purchase == null ? '' : qtyText(widget.purchase!.given).replaceAll(',', ''));
+  late final actual = TextEditingController(
+      text: (widget.purchase != null && widget.purchase!.closed) ? qtyText(widget.purchase!.actual).replaceAll(',', '') : '');
+  late final note = TextEditingController(text: widget.purchase?.note ?? '');
+
+  @override
+  Widget build(BuildContext context) {
+    final edit = widget.purchase != null;
+    final g = num2(given.text);
+    final a = num2(actual.text);
+    final String preview;
+    if (a <= 0) {
+      preview = 'لم تُسجَّل التكلفة بعد: يُعتبر ${money(g)} عهدة على الكابتن حتى يُكمل الشراء.';
+    } else if (a > g) {
+      preview = 'الكابتن دفع زيادة من جيبه، وسيُقيَّد له على المحل: ${money(a - g)}';
+    } else if (a < g) {
+      preview = 'متبقٍّ يعيده الكابتن للمحل: ${money(g - a)}';
+    } else {
+      preview = 'المبلغ مطابق، لا فرق.';
+    }
+    return Form(
+      key: form,
+      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text(edit ? 'تعديل المشتريات' : 'مشتريات خارجية جديدة', style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w900, color: C.g)),
+        const SizedBox(height: 14),
+        inp('وصف المشتريات (مثال: عبوات بلاستيك)', title, required: true),
+        inp('المبلغ المسلَّم للكابتن (YER)', given, type: numType, onChanged: (_) => setState(() {})),
+        inp('التكلفة الفعلية (اتركها فارغة إن لم يُكمل الشراء)', actual, type: numType, onChanged: (_) => setState(() {})),
+        inp('ملاحظات / رقم الفاتورة', note, lines: 2),
+        Container(
+          margin: const EdgeInsets.only(bottom: 12),
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(color: C.gold.withOpacity(.12), borderRadius: BorderRadius.circular(14)),
+          child: Text(preview, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12)),
+        ),
+        LuxButton('حفظ', Icons.save_rounded, () {
+          if (!form.currentState!.validate()) return;
+          final st = context.read<AppStore>();
+          final pr = widget.purchase ?? Purchase(id: 0, captainId: widget.captainId, title: '', given: 0, date: DateTime.now());
+          pr.title = title.text.trim();
+          pr.given = num2(given.text);
+          pr.actual = num2(actual.text);
+          pr.closed = actual.text.trim().isNotEmpty && pr.actual > 0;
+          pr.note = note.text.trim();
+          st.savePurchase(pr);
+          Navigator.pop(context);
+          toast(context, 'تم حفظ المشتريات');
+        }),
+      ]),
     );
   }
 }
