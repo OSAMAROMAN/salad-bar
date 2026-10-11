@@ -1,6 +1,7 @@
 // سلطة بار — نظام إدارة الطلبات (نسخة أندرويد / APK)
 // الدخول الافتراضي: admin / 1234
 // الحزم: image_picker, url_launcher, path_provider, share_plus, file_picker
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -11,10 +12,13 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
+
+import 'cloud_config.dart';
 
 // ====================================================================
 //  أدوات عامة
@@ -281,10 +285,18 @@ class Captain {
   int id;
   String name, phone;
   bool available;
-  Captain({required this.id, required this.name, required this.phone, this.available = true});
-  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'phone': phone, 'available': available};
-  factory Captain.fromJson(Map<String, dynamic> j) =>
-      Captain(id: j['id'], name: j['name'], phone: j['phone'] ?? '', available: j['available'] ?? true);
+  String? login, cloudUid; // حساب دخول الكابتن للتطبيق (سحابي)
+  Captain({required this.id, required this.name, required this.phone, this.available = true, this.login, this.cloudUid});
+  Map<String, dynamic> toJson() =>
+      {'id': id, 'name': name, 'phone': phone, 'available': available, 'login': login, 'cloudUid': cloudUid};
+  factory Captain.fromJson(Map<String, dynamic> j) => Captain(
+        id: j['id'],
+        name: j['name'],
+        phone: j['phone'] ?? '',
+        available: j['available'] ?? true,
+        login: j['login'],
+        cloudUid: j['cloudUid'],
+      );
 }
 
 class OrderItem {
@@ -948,6 +960,310 @@ const numType = TextInputType.numberWithOptions(decimal: true);
 double num2(String s) => double.tryParse(s.trim().replaceAll(',', '')) ?? 0;
 
 // ====================================================================
+//  الربط السحابي (Firebase عبر REST)
+// ====================================================================
+
+final GlobalKey<ScaffoldMessengerState> messengerKey = GlobalKey<ScaffoldMessengerState>();
+
+void toastGlobal(String m) {
+  messengerKey.currentState
+    ?..hideCurrentSnackBar()
+    ..showSnackBar(SnackBar(
+      content: Text(m),
+      behavior: SnackBarBehavior.floating,
+      backgroundColor: C.g,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+    ));
+}
+
+String cKey(int id) => 'c$id';
+String oKey(int id) => 'o$id';
+int _keyNum(String k) => int.tryParse(k.length > 1 ? k.substring(1) : '') ?? 0;
+bool _ok(http.Response? r) => r != null && r.statusCode >= 200 && r.statusCode < 300;
+
+Map<String, dynamic> _asMap(dynamic j) {
+  if (j is Map) return Map<String, dynamic>.from(j);
+  if (j is List) {
+    return {for (var i = 0; i < j.length; i++) if (j[i] != null) '$i': j[i]};
+  }
+  return {};
+}
+
+List<Map<String, dynamic>> asMapList(dynamic v) {
+  final Iterable it = v is List ? v : (v is Map ? v.values : const []);
+  return [for (final e in it) if (e is Map) Map<String, dynamic>.from(e)];
+}
+
+String fbErr(String m) {
+  final k = m.split(' ').first.trim();
+  switch (k) {
+    case 'EMAIL_EXISTS':
+      return 'اسم الدخول أو البريد مستخدم مسبقاً';
+    case 'INVALID_LOGIN_CREDENTIALS':
+    case 'INVALID_PASSWORD':
+    case 'EMAIL_NOT_FOUND':
+      return 'اسم الدخول أو كلمة المرور غير صحيحة';
+    case 'WEAK_PASSWORD':
+      return 'كلمة المرور ضعيفة (6 أحرف على الأقل)';
+    case 'INVALID_EMAIL':
+      return 'البريد الإلكتروني غير صالح';
+    case 'OPERATION_NOT_ALLOWED':
+      return 'فعّل تسجيل الدخول بالبريد وكلمة المرور في Firebase (Authentication)';
+    case 'TOO_MANY_ATTEMPTS_TRY_LATER':
+      return 'محاولات كثيرة، حاول لاحقاً';
+    case 'API_KEY_INVALID':
+    case 'INVALID_API_KEY':
+      return 'مفتاح Firebase غير صحيح في cloud_config.dart';
+    default:
+      return 'خطأ: $m';
+  }
+}
+
+class CloudService extends ChangeNotifier {
+  String? email, password, uid, role, captainKey, name;
+  String? _token;
+  DateTime _exp = DateTime(2000);
+  File? _file;
+  String? _ordersEtag;
+  Map<String, dynamic>? _ordersCache;
+
+  bool get configured => !kFbApiKey.startsWith('PASTE') && !kFbDbUrl.startsWith('PASTE');
+  bool get signedIn => uid != null && role != null;
+  bool get isOwner => signedIn && role == 'owner';
+  bool get isCaptain => signedIn && role == 'captain';
+  int get captainId => _keyNum(captainKey ?? 'c0');
+
+  Future<void> load() async {
+    try {
+      final d = await getApplicationDocumentsDirectory();
+      _file = File('${d.path}/cloud_session.json');
+      if (await _file!.exists()) {
+        final j = jsonDecode(await _file!.readAsString()) as Map<String, dynamic>;
+        email = j['email'];
+        password = j['password'];
+        uid = j['uid'];
+        role = j['role'];
+        captainKey = j['captainKey'];
+        name = j['name'];
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _store() async {
+    try {
+      final f = _file;
+      if (f == null) return;
+      if (uid == null || role == null) {
+        if (await f.exists()) await f.delete();
+      } else {
+        await f.writeAsString(
+            jsonEncode({'email': email, 'password': password, 'uid': uid, 'role': role, 'captainKey': captainKey, 'name': name}),
+            flush: true);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> logout() async {
+    email = password = uid = role = captainKey = name = null;
+    _token = null;
+    _ordersEtag = null;
+    _ordersCache = null;
+    await _store();
+    notifyListeners();
+  }
+
+  // ---- Auth ----
+  Future<Map<String, dynamic>> _identity(String op, String em, String pw) async {
+    final r = await http
+        .post(Uri.parse('https://identitytoolkit.googleapis.com/v1/$op?key=$kFbApiKey'),
+            headers: {'Content-Type': 'application/json'}, body: jsonEncode({'email': em, 'password': pw, 'returnSecureToken': true}))
+        .timeout(const Duration(seconds: 20));
+    return Map<String, dynamic>.from(jsonDecode(r.body) as Map);
+  }
+
+  Future<String?> _signInRaw(String em, String pw, {bool create = false}) async {
+    try {
+      final j = await _identity(create ? 'accounts:signUp' : 'accounts:signInWithPassword', em, pw);
+      if (j['error'] != null) return fbErr('${(j['error'] as Map)['message'] ?? ''}');
+      _token = j['idToken'] as String;
+      _exp = DateTime.now().add(Duration(seconds: int.tryParse('${j['expiresIn']}') ?? 3600));
+      uid = j['localId'] as String;
+      email = em;
+      password = pw;
+      return null;
+    } catch (_) {
+      return 'تعذّر الاتصال بالإنترنت';
+    }
+  }
+
+  Future<String?> _tok() async {
+    if (_token != null && DateTime.now().isBefore(_exp.subtract(const Duration(minutes: 2)))) return _token;
+    if (email == null || password == null) return null;
+    final e = await _signInRaw(email!, password!);
+    return e == null ? _token : null;
+  }
+
+  // ---- قاعدة البيانات ----
+  Future<http.Response?> _db(String method, String path, {Object? body, Map<String, String>? q, Map<String, String>? hdr}) async {
+    final t = await _tok();
+    if (t == null) return null;
+    final base = kFbDbUrl.replaceAll(RegExp(r'/+$'), '');
+    final uri = Uri.parse('$base/$path.json').replace(queryParameters: {'auth': t, ...?q});
+    final h = <String, String>{'Content-Type': 'application/json', ...?hdr};
+    try {
+      final Future<http.Response> f = switch (method) {
+        'GET' => http.get(uri, headers: h),
+        'PUT' => http.put(uri, headers: h, body: jsonEncode(body)),
+        'DELETE' => http.delete(uri, headers: h),
+        _ => http.patch(uri, headers: h, body: jsonEncode(body)),
+      };
+      return await f.timeout(const Duration(seconds: 20));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ---- تفعيل حساب المالك ----
+  Future<String?> ownerActivate(String em, String pw, String ownerName) async {
+    if (!configured) return 'أكمل إعدادات Firebase في ملف cloud_config.dart أولاً';
+    var e = await _signInRaw(em, pw, create: true);
+    if (e != null && e == fbErr('EMAIL_EXISTS')) e = await _signInRaw(em, pw);
+    if (e != null) return e;
+    final g = await _db('GET', 'users/$uid');
+    if (g == null) return 'تعذّر الاتصال بقاعدة البيانات، تأكد من الرابط في cloud_config.dart';
+    if (!_ok(g)) return 'رُفض الوصول: تأكد من نشر قواعد قاعدة البيانات (Rules)';
+    final cur = jsonDecode(g.body);
+    if (cur is Map && cur['role'] == 'owner') {
+      // حساب مالك موجود
+    } else if (cur == null) {
+      final p = await _db('PUT', 'users/$uid', body: {'role': 'owner', 'name': ownerName});
+      if (!_ok(p)) return 'يوجد مالك مسجّل بحساب آخر، أو القواعد غير منشورة';
+    } else {
+      return 'هذا الحساب مسجّل بدور آخر';
+    }
+    role = 'owner';
+    captainKey = null;
+    name = ownerName;
+    await _store();
+    notifyListeners();
+    return null;
+  }
+
+  // ---- حسابات الكباتن (المالك) ----
+  String captainEmail(String login) => '${login.trim().toLowerCase()}@saladbar.app';
+
+  Future<(String?, String?)> createCaptainAccount(int cid, String cname, String login, String pw) async {
+    if (!isOwner) return ('فعّل الربط السحابي من الإعدادات أولاً', null);
+    final l = login.trim().toLowerCase();
+    if (!RegExp(r'^[a-z0-9._-]{3,30}$').hasMatch(l)) return ('اسم الدخول: حروف إنجليزية وأرقام فقط (3 أحرف على الأقل)', null);
+    if (pw.length < 6) return ('كلمة المرور 6 أحرف على الأقل', null);
+    try {
+      final j = await _identity('accounts:signUp', captainEmail(l), pw);
+      if (j['error'] != null) return (fbErr('${(j['error'] as Map)['message'] ?? ''}'), null);
+      final newUid = j['localId'] as String;
+      final r = await _db('PUT', 'users/$newUid', body: {'role': 'captain', 'captainId': cKey(cid), 'name': cname, 'login': l});
+      if (!_ok(r)) return ('تعذّر ربط الحساب بقاعدة البيانات', null);
+      return (null, newUid);
+    } catch (_) {
+      return ('تعذّر الاتصال بالإنترنت', null);
+    }
+  }
+
+  Future<bool> revokeCaptain(String captainUid) async => _ok(await _db('DELETE', 'users/$captainUid'));
+
+  // ---- المالك: رفع الطلبات والحسابات ----
+  Future<bool> putOrder(int cid, int oid, Map<String, dynamic> data) async =>
+      _ok(await _db('PUT', 'captainOrders/${cKey(cid)}/${oKey(oid)}', body: data));
+
+  Future<bool> deleteOrder(int cid, int oid) async => _ok(await _db('DELETE', 'captainOrders/${cKey(cid)}/${oKey(oid)}'));
+
+  Future<bool> putStats(int cid, Map<String, dynamic> data) async => _ok(await _db('PUT', 'captainStats/${cKey(cid)}', body: data));
+
+  Future<List<int>?> listOrderIds(int cid) async {
+    final r = await _db('GET', 'captainOrders/${cKey(cid)}', q: {'shallow': 'true'});
+    if (!_ok(r)) return null;
+    final j = jsonDecode(r!.body);
+    if (j is Map) return [for (final k in j.keys) _keyNum('$k')];
+    return [];
+  }
+
+  Future<List<Map<String, dynamic>>?> fetchInbox() async {
+    final r = await _db('GET', 'inbox');
+    if (!_ok(r)) return null;
+    final j = jsonDecode(r!.body);
+    final out = <Map<String, dynamic>>[];
+    if (j is Map) {
+      j.forEach((ck, v) {
+        if (v is Map) {
+          v.forEach((ok2, d) {
+            if (d is Map) {
+              out.add({'cid': _keyNum('$ck'), 'oid': _keyNum('$ok2'), 'status': '${d['status']}', 'name': '${d['name'] ?? ''}'});
+            }
+          });
+        }
+      });
+    }
+    return out;
+  }
+
+  Future<bool> deleteInbox(int cid, int oid) async => _ok(await _db('DELETE', 'inbox/${cKey(cid)}/${oKey(oid)}'));
+
+  // ---- الكابتن ----
+  Future<String?> captainLogin(String login, String pw) async {
+    if (!configured) return 'لم يُضبط Firebase في التطبيق، راجع صاحب المتجر';
+    final e = await _signInRaw(captainEmail(login), pw);
+    if (e != null) return e;
+    final g = await _db('GET', 'users/$uid');
+    if (!_ok(g)) {
+      await logout();
+      return 'تعذّر الاتصال بقاعدة البيانات';
+    }
+    final cur = jsonDecode(g!.body);
+    if (cur is! Map || cur['role'] != 'captain') {
+      await logout();
+      return 'هذا الحساب غير مفعّل كابتن لدى صاحب المتجر';
+    }
+    role = 'captain';
+    captainKey = '${cur['captainId']}';
+    name = '${cur['name'] ?? ''}';
+    await _store();
+    notifyListeners();
+    return null;
+  }
+
+  /// null = فشل الاتصال، {} = لا توجد طلبات
+  Future<Map<String, dynamic>?> fetchMyOrders() async {
+    if (captainKey == null) return null;
+    final r = await _db('GET', 'captainOrders/$captainKey', hdr: {'X-Firebase-ETag': 'true', if (_ordersEtag != null) 'if-none-match': _ordersEtag!});
+    if (r == null) return null;
+    if (r.statusCode == 304) return _ordersCache ?? {};
+    if (!_ok(r)) return null;
+    _ordersEtag = r.headers['etag'];
+    _ordersCache = _asMap(jsonDecode(r.body));
+    return _ordersCache;
+  }
+
+  Future<Map<String, dynamic>?> fetchMyStats() async {
+    if (captainKey == null) return null;
+    final r = await _db('GET', 'captainStats/$captainKey');
+    if (!_ok(r)) return null;
+    return _asMap(jsonDecode(r!.body));
+  }
+
+  Future<bool> captainSetStatus(int oid, String status) async {
+    if (captainKey == null) return false;
+    final inbox = await _db('PUT', 'inbox/$captainKey/${oKey(oid)}',
+        body: {'status': status, 'at': DateTime.now().toIso8601String(), 'name': name ?? ''});
+    if (!_ok(inbox)) return false;
+    await _db('PUT', 'captainOrders/$captainKey/${oKey(oid)}/status', body: status);
+    _ordersEtag = null;
+    return true;
+  }
+}
+
+final CloudService cloud = CloudService();
+
+// ====================================================================
 //  المخزن (Store)
 // ====================================================================
 
@@ -1061,6 +1377,7 @@ class AppStore extends ChangeNotifier {
   void _save() {
     _persist(jsonEncode(toJson()));
     notifyListeners();
+    _scheduleStats();
   }
 
   String exportJson() => const JsonEncoder.withIndent('  ').convert(toJson());
@@ -1197,6 +1514,8 @@ class AppStore extends ChangeNotifier {
 
   String? deleteCaptain(int id) {
     if (orders.any((o) => o.captainId == id && o.status != 'cancel')) return 'لا يمكن حذف كابتن لديه طلبات غير ملغاة';
+    final capUid = captain(id)?.cloudUid;
+    if (capUid != null && cloud.isOwner) cloud.revokeCaptain(capUid);
     captains.removeWhere((x) => x.id == id);
     settlements.removeWhere((x) => x.captainId == id);
     purchases.removeWhere((x) => x.captainId == id);
@@ -1258,6 +1577,151 @@ class AppStore extends ChangeNotifier {
     return null;
   }
 
+  // ---- الربط السحابي ----
+  final Set<int> _dirty = {};
+  Timer? _poll, _statsTimer;
+  bool _polling = false;
+
+  Map<String, dynamic> orderSnapshot(Order o) {
+    final c = customer(o.customerId);
+    return {
+      'id': o.id,
+      'captainId': o.captainId,
+      'date': o.date.toIso8601String(),
+      'status': o.status,
+      'method': o.method,
+      'customerName': c?.name ?? '',
+      'customerPhone': c?.phone ?? '',
+      'customerAddress': c?.address ?? '',
+      'customerNotes': c?.notes ?? '',
+      'items': [
+        for (final i in o.items) {'name': i.name, 'qty': i.qty, 'unit': i.unit, 'price': i.price, 'total': i.lineTotal}
+      ],
+      'subtotal': o.subtotal,
+      'discount': o.discount,
+      'delivery': o.delivery,
+      'total': o.total,
+      'customerDue': o.customerDue,
+      'paidAmount': o.paidAmount,
+      'goodsDue': o.goodsDue,
+      'notes': o.notes,
+      'store': settings.storeName,
+    };
+  }
+
+  bool _recent(Order o) =>
+      o.status == 'new' || o.status == 'prep' || o.status == 'delivery' || DateTime.now().difference(o.date).inDays < 2;
+
+  int _rank(String s) => switch (s) { 'new' => 0, 'prep' => 1, 'delivery' => 2, 'done' => 3, _ => -1 };
+
+  Future<bool> _pushOrder(Order o) async {
+    final ok = await cloud.putOrder(o.captainId, o.id, orderSnapshot(o));
+    if (ok) {
+      _dirty.remove(o.id);
+    } else {
+      _dirty.add(o.id);
+    }
+    return ok;
+  }
+
+  void _syncOrder(Order o) {
+    if (cloud.isOwner) _pushOrder(o);
+  }
+
+  void _scheduleStats() {
+    if (!cloud.isOwner) return;
+    _statsTimer?.cancel();
+    _statsTimer = Timer(const Duration(seconds: 3), pushStats);
+  }
+
+  Future<void> pushStats() async {
+    if (!cloud.isOwner) return;
+    for (final c in captains.where((c) => c.login != null)) {
+      final b = balances(c.id);
+      await cloud.putStats(c.id, {
+        'cashDue': b.cashDue,
+        'creditDue': b.creditDue,
+        'net': b.net,
+        'name': c.name,
+        'store': settings.storeName,
+        'at': DateTime.now().toIso8601String(),
+      });
+    }
+  }
+
+  Future<void> pushCaptain(int cid) async {
+    for (final o in orders.where((o) => o.captainId == cid && _recent(o)).toList()) {
+      await _pushOrder(o);
+    }
+    await pushStats();
+  }
+
+  /// يرفع الطلبات الحديثة والحسابات ثم ينظّف السحابة من القديم
+  Future<int> fullSync() async {
+    if (!cloud.isOwner) return 0;
+    var n = 0;
+    for (final o in orders.where(_recent).toList()) {
+      if (await _pushOrder(o)) n++;
+    }
+    await pushStats();
+    await cleanupCloud();
+    return n;
+  }
+
+  Future<void> cleanupCloud() async {
+    final now = DateTime.now();
+    for (final c in captains.where((c) => c.login != null).toList()) {
+      final ids = await cloud.listOrderIds(c.id);
+      if (ids == null) continue;
+      for (final oid in ids) {
+        final o = order(oid);
+        final old = o == null || ((o.status == 'done' || o.status == 'cancel') && now.difference(o.date).inDays >= 2);
+        if (old) await cloud.deleteOrder(c.id, oid);
+      }
+    }
+  }
+
+  void startCloud() {
+    _poll?.cancel();
+    if (!cloud.isOwner) return;
+    _poll = Timer.periodic(const Duration(seconds: 8), (_) => pollCloud());
+    fullSync();
+  }
+
+  void stopCloud() {
+    _poll?.cancel();
+    _poll = null;
+  }
+
+  Future<void> pollCloud() async {
+    if (_polling || !cloud.isOwner) return;
+    _polling = true;
+    try {
+      for (final id in _dirty.toList()) {
+        final o = order(id);
+        if (o == null) {
+          _dirty.remove(id);
+        } else {
+          await _pushOrder(o);
+        }
+      }
+      final inbox = await cloud.fetchInbox();
+      if (inbox == null) return;
+      for (final m in inbox) {
+        final cid = m['cid'] as int, oid = m['oid'] as int;
+        final st = '${m['status']}';
+        final o = order(oid);
+        if (o != null && o.captainId == cid && (st == 'delivery' || st == 'done') && _rank(st) > _rank(o.status)) {
+          changeStatus(o, st);
+          toastGlobal('${captain(cid)?.name ?? 'الكابتن'}: الطلب #$oid ← ${statusLabel(st)}');
+        }
+        await cloud.deleteInbox(cid, oid);
+      }
+    } finally {
+      _polling = false;
+    }
+  }
+
   // ---- Orders ----
   Order createOrder({
     required int customerId,
@@ -1303,6 +1767,7 @@ class AppStore extends ChangeNotifier {
     }
     orders.add(o);
     _save();
+    _syncOrder(o);
     return o;
   }
 
@@ -1324,6 +1789,7 @@ class AppStore extends ChangeNotifier {
     }
     o.status = s;
     _save();
+    _syncOrder(o);
     return null;
   }
 
@@ -1336,6 +1802,7 @@ class AppStore extends ChangeNotifier {
         if (p != null) p.stock += i.qty;
       }
     }
+    if (cloud.isOwner) cloud.deleteOrder(o.captainId, id);
     orders.removeWhere((x) => x.id == id);
     _save();
   }
@@ -1434,7 +1901,9 @@ class LoginScreen extends StatefulWidget {
 class _LoginScreenState extends State<LoginScreen> {
   final u = TextEditingController(text: 'admin');
   final p = TextEditingController();
-  bool hide = true;
+  final cu = TextEditingController();
+  final cp = TextEditingController();
+  bool hide = true, captain = false, busy = false;
 
   @override
   Widget build(BuildContext context) {
@@ -1457,28 +1926,63 @@ class _LoginScreenState extends State<LoginScreen> {
                   boxShadow: const [BoxShadow(color: Color(0x66000000), blurRadius: 60, offset: Offset(0, 24))],
                 ),
                 child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  Avatar(s.settings.logoPath, size: 110, fallback: Icons.eco_rounded),
+                  Avatar(s.settings.logoPath, size: 100, fallback: Icons.eco_rounded),
                   const SizedBox(height: 14),
                   Text(s.settings.storeName, style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w900, color: C.g)),
                   const Text('مكرونة مخلوطة .. طعم يرضيك', style: TextStyle(color: C.muted, fontWeight: FontWeight.w700, fontSize: 13)),
-                  const SizedBox(height: 22),
-                  TextField(controller: u, decoration: const InputDecoration(labelText: 'اسم المستخدم', prefixIcon: Icon(Icons.person_outline))),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: p,
-                    obscureText: hide,
-                    onSubmitted: (_) => _go(s),
-                    decoration: InputDecoration(
-                      labelText: 'كلمة المرور',
-                      prefixIcon: const Icon(Icons.lock_outline),
-                      suffixIcon: IconButton(icon: Icon(hide ? Icons.visibility_off : Icons.visibility), onPressed: () => setState(() => hide = !hide)),
-                    ),
-                  ),
                   const SizedBox(height: 18),
-                  LuxButton('تسجيل الدخول', Icons.login_rounded, () => _go(s)),
-                  const SizedBox(height: 12),
-                  const Text('بيانات البداية: admin / 1234 — يمكن تغييرها من الإعدادات.',
-                      textAlign: TextAlign.center, style: TextStyle(fontSize: 11, color: Color(0xFF9AA59F))),
+                  SegmentedButton<bool>(
+                    showSelectedIcon: false,
+                    segments: const [
+                      ButtonSegment(value: false, label: Text('صاحب المتجر'), icon: Icon(Icons.storefront_rounded)),
+                      ButtonSegment(value: true, label: Text('كابتن'), icon: Icon(Icons.two_wheeler_rounded)),
+                    ],
+                    selected: {captain},
+                    onSelectionChanged: (v) => setState(() => captain = v.first),
+                  ),
+                  const SizedBox(height: 16),
+                  if (!captain) ...[
+                    TextField(controller: u, decoration: const InputDecoration(labelText: 'اسم المستخدم', prefixIcon: Icon(Icons.person_outline))),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: p,
+                      obscureText: hide,
+                      onSubmitted: (_) => _go(s),
+                      decoration: InputDecoration(
+                        labelText: 'كلمة المرور',
+                        prefixIcon: const Icon(Icons.lock_outline),
+                        suffixIcon: IconButton(icon: Icon(hide ? Icons.visibility_off : Icons.visibility), onPressed: () => setState(() => hide = !hide)),
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    LuxButton('تسجيل الدخول', Icons.login_rounded, () => _go(s)),
+                    const SizedBox(height: 12),
+                    const Text('بيانات البداية: admin / 1234 — يمكن تغييرها من الإعدادات.',
+                        textAlign: TextAlign.center, style: TextStyle(fontSize: 11, color: Color(0xFF9AA59F))),
+                  ] else ...[
+                    TextField(
+                      controller: cu,
+                      keyboardType: TextInputType.visiblePassword,
+                      autocorrect: false,
+                      decoration: const InputDecoration(labelText: 'اسم الدخول (إنجليزي)', prefixIcon: Icon(Icons.badge_outlined)),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: cp,
+                      obscureText: hide,
+                      onSubmitted: (_) => _goCaptain(),
+                      decoration: InputDecoration(
+                        labelText: 'كلمة المرور',
+                        prefixIcon: const Icon(Icons.lock_outline),
+                        suffixIcon: IconButton(icon: Icon(hide ? Icons.visibility_off : Icons.visibility), onPressed: () => setState(() => hide = !hide)),
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    LuxButton(busy ? 'جاري الدخول...' : 'دخول الكابتن', Icons.two_wheeler_rounded, busy ? null : _goCaptain),
+                    const SizedBox(height: 12),
+                    const Text('اسم الدخول وكلمة المرور يزوّدك بهما صاحب المتجر.',
+                        textAlign: TextAlign.center, style: TextStyle(fontSize: 11, color: Color(0xFF9AA59F))),
+                  ],
                 ]),
               ),
             ),
@@ -1490,6 +1994,15 @@ class _LoginScreenState extends State<LoginScreen> {
 
   void _go(AppStore s) {
     if (!s.login(u.text, p.text)) toast(context, 'اسم المستخدم أو كلمة المرور غير صحيحة');
+  }
+
+  Future<void> _goCaptain() async {
+    if (cu.text.trim().isEmpty || cp.text.isEmpty) return toast(context, 'أدخل اسم الدخول وكلمة المرور');
+    setState(() => busy = true);
+    final err = await cloud.captainLogin(cu.text, cp.text);
+    if (!mounted) return;
+    setState(() => busy = false);
+    if (err != null) toast(context, err);
   }
 }
 
@@ -2834,6 +3347,11 @@ class CaptainsPage extends StatelessWidget {
             label: const Text('كشف الحساب'),
           ),
           TextButton.icon(
+            onPressed: () => showSheet(context, (_) => _CaptainAccountSheet(captain: c)),
+            icon: Icon(c.login == null ? Icons.phone_android_rounded : Icons.verified_user_rounded, size: 18, color: c.login == null ? C.muted : C.g2),
+            label: Text(c.login == null ? 'حساب التطبيق' : 'حساب التطبيق ✓'),
+          ),
+          TextButton.icon(
             onPressed: () => sendWa(context, c.phone, _statement(s, c)),
             icon: const Icon(Icons.chat_rounded, size: 18, color: C.wa),
             label: const Text('واتساب', style: TextStyle(color: C.wa)),
@@ -3113,6 +3631,91 @@ class CaptainLedgerPage extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+class _CaptainAccountSheet extends StatefulWidget {
+  final Captain captain;
+  const _CaptainAccountSheet({required this.captain});
+  @override
+  State<_CaptainAccountSheet> createState() => _CaptainAccountSheetState();
+}
+
+class _CaptainAccountSheetState extends State<_CaptainAccountSheet> {
+  final login = TextEditingController();
+  final pw = TextEditingController();
+  bool busy = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.captain;
+    final title = Text('حساب تطبيق ${c.name}', style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w900, color: C.g));
+    if (!cloud.configured || !cloud.isOwner) {
+      return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        title,
+        const SizedBox(height: 12),
+        const Text('فعّل الربط السحابي أولاً من الإعدادات ← الربط السحابي، ثم ارجع هنا لإنشاء حساب الكابتن.', style: TextStyle(color: C.muted)),
+        const SizedBox(height: 12),
+      ]);
+    }
+    if (c.login != null) {
+      return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        title,
+        const SizedBox(height: 12),
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(color: C.g2.withOpacity(.1), borderRadius: BorderRadius.circular(14)),
+          child: Text('الحساب مفعّل ✓\nاسم الدخول: ${c.login}\nيدخل الكابتن من شاشة الدخول ← تبويب "كابتن".', style: const TextStyle(fontWeight: FontWeight.w800, height: 1.6)),
+        ),
+        const SizedBox(height: 12),
+        OutlinedButton.icon(
+          onPressed: busy
+              ? null
+              : () async {
+                  if (!await confirmDialog(context, 'إلغاء صلاحية دخول ${c.name} للتطبيق؟', yes: 'إلغاء الصلاحية')) return;
+                  setState(() => busy = true);
+                  final uidC = c.cloudUid;
+                  final ok = uidC == null ? true : await cloud.revokeCaptain(uidC);
+                  if (!mounted) return;
+                  setState(() => busy = false);
+                  if (!ok) return toast(context, 'تعذّر إلغاء الصلاحية، تحقق من الاتصال');
+                  c.login = null;
+                  c.cloudUid = null;
+                  context.read<AppStore>().saveCaptain(c);
+                  Navigator.pop(context);
+                  toast(context, 'تم إلغاء صلاحية الدخول');
+                },
+          icon: const Icon(Icons.block_rounded, color: C.red),
+          label: const Text('إلغاء صلاحية الدخول', style: TextStyle(color: C.red)),
+        ),
+        const SizedBox(height: 8),
+      ]);
+    }
+    return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      title,
+      const SizedBox(height: 12),
+      const Text('أنشئ لهذا الكابتن اسم دخول وكلمة مرور ليدخل بهما من تطبيقه ويرى طلباته.', style: TextStyle(color: C.muted, fontSize: 12)),
+      const SizedBox(height: 12),
+      inp('اسم الدخول (حروف إنجليزية وأرقام، مثال: osama)', login),
+      inp('كلمة المرور (6 أحرف على الأقل)', pw),
+      LuxButton(busy ? 'جاري الإنشاء...' : 'إنشاء الحساب', Icons.person_add_alt_1, busy
+          ? null
+          : () async {
+              setState(() => busy = true);
+              final (err, newUid) = await cloud.createCaptainAccount(c.id, c.name, login.text, pw.text);
+              if (!mounted) return;
+              setState(() => busy = false);
+              if (err != null) return toast(context, err);
+              final st = context.read<AppStore>();
+              c.login = login.text.trim().toLowerCase();
+              c.cloudUid = newUid;
+              st.saveCaptain(c);
+              st.pushCaptain(c.id);
+              Navigator.pop(context);
+              toast(context, 'تم إنشاء حساب الكابتن ✓');
+            }),
+      const SizedBox(height: 8),
+    ]);
   }
 }
 
@@ -3417,6 +4020,45 @@ class _SettingsPageState extends State<SettingsPage> {
               OutlinedButton.icon(onPressed: _import, icon: const Icon(Icons.download_rounded), label: const Text('لصق واستيراد نص')),
             ]),
           ),
+          const PageHead('الربط السحابي (تطبيق الكابتن)'),
+          ListenableBuilder(
+            listenable: cloud,
+            builder: (context, _) => LuxCard(
+              accent: cloud.isOwner ? C.g2 : C.orange,
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                if (!cloud.configured)
+                  const Text('لم يُضبط Firebase بعد. عدّل ملف lib/cloud_config.dart بمفتاح المشروع ورابط قاعدة البيانات (انظر ملف firebase_setup.md).',
+                      style: TextStyle(color: C.muted, fontSize: 12, height: 1.6))
+                else if (cloud.isOwner) ...[
+                  Text('متصل بالسحابة ✓\n${cloud.email ?? ''}', style: const TextStyle(fontWeight: FontWeight.w800, height: 1.6)),
+                  const SizedBox(height: 10),
+                  OutlinedButton.icon(
+                    onPressed: () async {
+                      toast(context, 'جاري المزامنة...');
+                      final n = await s.fullSync();
+                      if (mounted) toast(context, 'تمت المزامنة ($n طلب)');
+                    },
+                    icon: const Icon(Icons.sync_rounded),
+                    label: const Text('مزامنة كل البيانات الآن'),
+                  ),
+                  const SizedBox(height: 8),
+                  TextButton(
+                    onPressed: () async {
+                      if (await confirmDialog(context, 'فصل هذا الجهاز عن السحابة؟ لن تصل الطلبات للكباتن حتى تعيد التفعيل.', yes: 'فصل')) {
+                        s.stopCloud();
+                        await cloud.logout();
+                      }
+                    },
+                    child: const Text('فصل الربط', style: TextStyle(color: C.red)),
+                  ),
+                ] else ...[
+                  const Text('فعّل الربط ليرى الكباتن طلباتهم في تطبيقهم، وتصلك تحديثات الحالة منهم.', style: TextStyle(color: C.muted, fontSize: 12, height: 1.6)),
+                  const SizedBox(height: 10),
+                  LuxButton('تفعيل الربط السحابي', Icons.cloud_done_rounded, _activate),
+                ],
+              ]),
+            ),
+          ),
           const PageHead('منطقة الخطر'),
           LuxCard(
             accent: C.red,
@@ -3437,6 +4079,37 @@ class _SettingsPageState extends State<SettingsPage> {
         ]),
       ),
     );
+  }
+
+  Future<void> _activate() async {
+    final em = TextEditingController();
+    final pw = TextEditingController();
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+        title: const Text('تفعيل الربط السحابي'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text('أدخل بريدك الإلكتروني وكلمة مرور (6 أحرف فأكثر). أول مرة يُنشأ الحساب تلقائياً، ولاحقاً استخدم نفس البيانات.', style: TextStyle(fontSize: 12, color: C.muted)),
+          const SizedBox(height: 12),
+          TextField(controller: em, keyboardType: TextInputType.emailAddress, decoration: const InputDecoration(labelText: 'البريد الإلكتروني')),
+          const SizedBox(height: 10),
+          TextField(controller: pw, obscureText: true, decoration: const InputDecoration(labelText: 'كلمة المرور')),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('تفعيل')),
+        ],
+      ),
+    );
+    if (go != true || !mounted) return;
+    if (!em.text.contains('@') || pw.text.length < 6) return toast(context, 'أدخل بريداً صحيحاً وكلمة مرور 6 أحرف على الأقل');
+    toast(context, 'جاري الاتصال...');
+    final err = await cloud.ownerActivate(em.text.trim(), pw.text, s.settings.ownerName);
+    if (!mounted) return;
+    if (err != null) return toast(context, err);
+    s.startCloud();
+    toast(context, 'تم تفعيل الربط السحابي ✓');
   }
 
   void _export() {
@@ -3517,6 +4190,20 @@ class HomeShell extends StatefulWidget {
 class _HomeShellState extends State<HomeShell> {
   int index = 0;
   final key = GlobalKey<ScaffoldState>();
+  late final AppStore _store;
+
+  @override
+  void initState() {
+    super.initState();
+    _store = context.read<AppStore>();
+    _store.startCloud();
+  }
+
+  @override
+  void dispose() {
+    _store.stopCloud();
+    super.dispose();
+  }
 
   static const titles = ['الرئيسية', 'الطلبات', 'الأصناف والمخزون', 'العملاء', 'الكباتن', 'التقارير والمبيعات', 'الإعدادات'];
   static const icons = [
@@ -3667,6 +4354,7 @@ class _HomeShellState extends State<HomeShell> {
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final raw = await loadPersisted();
+  await cloud.load();
   final store = AppStore()..init(raw);
   runApp(StoreScope(notifier: store, child: const SaladBarApp()));
 }
@@ -3680,8 +4368,296 @@ class SaladBarApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'سلطة بار',
       theme: buildTheme(),
+      scaffoldMessengerKey: messengerKey,
       builder: (context, child) => Directionality(textDirection: TextDirection.rtl, child: child!),
-      home: s.loggedIn ? const HomeShell() : const LoginScreen(),
+      home: ListenableBuilder(
+        listenable: cloud,
+        builder: (context, _) => cloud.isCaptain ? const CaptainHome() : (s.loggedIn ? const HomeShell() : const LoginScreen()),
+      ),
     );
+  }
+}
+
+// ====================================================================
+//  واجهة الكابتن
+// ====================================================================
+
+Future<void> openMap(BuildContext c, String address) async {
+  if (address.trim().isEmpty) return toast(c, 'لا يوجد عنوان');
+  var ok = false;
+  try {
+    ok = await launchUrl(Uri.parse('https://www.google.com/maps/search/?api=1&query=${Uri.encodeComponent(address)}'),
+        mode: LaunchMode.externalApplication);
+  } catch (_) {}
+  if (!ok && c.mounted) toast(c, 'تعذّر فتح الخريطة');
+}
+
+class CaptainHome extends StatefulWidget {
+  const CaptainHome({super.key});
+  @override
+  State<CaptainHome> createState() => _CaptainHomeState();
+}
+
+class _CaptainHomeState extends State<CaptainHome> {
+  List<Map<String, dynamic>> orders = [];
+  Map<String, dynamic>? stats;
+  bool loading = true, offline = false, busy = false;
+  DateTime? last;
+  int tab = 0;
+  Timer? timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+    timer = Timer.periodic(const Duration(seconds: 8), (_) => _load());
+  }
+
+  @override
+  void dispose() {
+    timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final o = await cloud.fetchMyOrders();
+    final st = await cloud.fetchMyStats();
+    if (!mounted) return;
+    setState(() {
+      loading = false;
+      if (o == null) {
+        offline = true;
+      } else {
+        offline = false;
+        last = DateTime.now();
+        orders = asMapList(o)..sort((a, b) => '${b['date']}'.compareTo('${a['date']}'));
+      }
+      if (st != null && st.isNotEmpty) stats = st;
+    });
+  }
+
+  bool _isActive(Map<String, dynamic> o) {
+    final st = '${o['status']}';
+    return st == 'new' || st == 'prep' || st == 'delivery';
+  }
+
+  Future<void> _set(Map<String, dynamic> o, String st) async {
+    if (busy) return;
+    setState(() => busy = true);
+    final ok = await cloud.captainSetStatus(_d(o['id']).toInt(), st);
+    if (!mounted) return;
+    setState(() {
+      busy = false;
+      if (ok) o['status'] = st;
+    });
+    toast(context, ok ? 'تم تحديث حالة الطلب ✓' : 'تعذّر التحديث — تحقق من الاتصال');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final active = orders.where(_isActive).toList();
+    final history = orders.where((o) => !_isActive(o)).toList();
+    final store = '${stats?['store'] ?? orders.firstOrNull?['store'] ?? 'سلطة بار'}';
+    final titles = ['طلباتي الحالية', 'الطلبات المنتهية', 'حسابي'];
+    return Scaffold(
+      appBar: AppBar(
+        flexibleSpace: Container(decoration: const BoxDecoration(gradient: C.brandGradient)),
+        titleSpacing: 12,
+        title: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+          Text(store, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900)),
+          Text('${titles[tab]} • ${cloud.name ?? ''}', style: const TextStyle(fontSize: 10, color: C.gold, fontWeight: FontWeight.w700)),
+        ]),
+        actions: [
+          IconButton(tooltip: 'تحديث', icon: const Icon(Icons.refresh_rounded), onPressed: _load),
+        ],
+      ),
+      body: Column(children: [
+        if (offline)
+          Container(
+            width: double.infinity,
+            color: C.orange.withOpacity(.15),
+            padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 12),
+            child: const Text('لا يوجد اتصال — تُعرض آخر بيانات محمّلة', textAlign: TextAlign.center, style: TextStyle(color: C.orange, fontWeight: FontWeight.w800, fontSize: 12)),
+          ),
+        Expanded(
+          child: loading
+              ? const Center(child: CircularProgressIndicator())
+              : switch (tab) {
+                  0 => _list(active, 'لا توجد طلبات حالياً', Icons.two_wheeler_rounded),
+                  1 => _list(history, 'لا توجد طلبات منتهية', Icons.history_rounded),
+                  _ => _account(),
+                },
+        ),
+      ]),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: tab,
+        onDestinationSelected: (i) => setState(() => tab = i),
+        destinations: [
+          NavigationDestination(
+            icon: Badge(label: Text('${active.length}'), isLabelVisible: active.isNotEmpty, child: const Icon(Icons.two_wheeler_outlined)),
+            selectedIcon: Badge(label: Text('${active.length}'), isLabelVisible: active.isNotEmpty, child: const Icon(Icons.two_wheeler_rounded)),
+            label: 'الحالية',
+          ),
+          const NavigationDestination(icon: Icon(Icons.history_outlined), selectedIcon: Icon(Icons.history_rounded), label: 'المنتهية'),
+          const NavigationDestination(icon: Icon(Icons.account_balance_wallet_outlined), selectedIcon: Icon(Icons.account_balance_wallet_rounded), label: 'حسابي'),
+        ],
+      ),
+    );
+  }
+
+  Widget _list(List<Map<String, dynamic>> list, String emptyText, IconData icon) {
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(14, 14, 14, 30),
+        children: [
+          if (list.isEmpty) Empty(emptyText, icon: icon),
+          for (final o in list) _card(o),
+        ],
+      ),
+    );
+  }
+
+  Widget _line(IconData i, String t) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Icon(i, size: 16, color: C.muted),
+          const SizedBox(width: 6),
+          Expanded(child: Text(t, style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700))),
+        ]),
+      );
+
+  Widget _card(Map<String, dynamic> o) {
+    final st = '${o['status'] ?? 'new'}';
+    final due = _d(o['customerDue']);
+    final fee = _d(o['delivery']);
+    final items = asMapList(o['items']);
+    final phone = '${o['customerPhone'] ?? ''}';
+    final addr = '${o['customerAddress'] ?? ''}';
+    final notes = '${o['notes'] ?? ''}';
+    final id = _d(o['id']).toInt();
+    final date = DateTime.tryParse('${o['date']}');
+    return LuxCard(
+      accent: statusColor(st),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Text('#$id', style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 17, color: C.g)),
+          const SizedBox(width: 8),
+          Expanded(child: Text('${o['customerName'] ?? '-'}', style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 15), overflow: TextOverflow.ellipsis)),
+          Badge2(statusLabel(st), statusColor(st)),
+        ]),
+        const SizedBox(height: 6),
+        if (phone.isNotEmpty) _line(Icons.phone_rounded, phone),
+        _line(Icons.location_on_rounded, addr.isEmpty ? 'لا يوجد عنوان' : addr),
+        if (date != null) _line(Icons.schedule_rounded, dateText(date)),
+        if (items.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(color: C.bg, borderRadius: BorderRadius.circular(12)),
+            child: Text(
+              items.map((i) => '• ${i['name']} × ${qtyText(_d(i['qty']))} ${unitShort('${i['unit'] ?? ''}')}').join('\n'),
+              style: const TextStyle(fontSize: 12, height: 1.6),
+            ),
+          ),
+        ],
+        const SizedBox(height: 8),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(color: (due > 0 ? C.orange : C.g2).withOpacity(.1), borderRadius: BorderRadius.circular(14)),
+          child: Column(children: [
+            Text(due > 0 ? 'المطلوب تحصيله من العميل' : '✅ مدفوع بالكامل — لا تحصّل أي مبلغ',
+                textAlign: TextAlign.center, style: TextStyle(color: due > 0 ? C.orange : C.g2, fontWeight: FontWeight.w900, fontSize: 13)),
+            if (due > 0) ...[
+              const SizedBox(height: 2),
+              Text(money(due), style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w900, color: C.dark)),
+              Text('يُورَّد للمحل: ${money(_d(o['goodsDue']))} • أجرتك: ${money(fee)} (تبقى معك)',
+                  textAlign: TextAlign.center, style: const TextStyle(fontSize: 11, color: C.muted)),
+            ] else
+              Text('أجرتك: ${money(fee)} (تُقيَّد لك على المحل)', textAlign: TextAlign.center, style: const TextStyle(fontSize: 11, color: C.muted)),
+          ]),
+        ),
+        if (notes.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 6), child: _line(Icons.sticky_note_2_outlined, 'ملاحظات: $notes')),
+        const Divider(height: 18),
+        Wrap(children: [
+          if (phone.isNotEmpty) TextButton.icon(onPressed: () => callPhone(context, phone), icon: const Icon(Icons.call_rounded, size: 18, color: C.blue), label: const Text('اتصال', style: TextStyle(color: C.blue))),
+          TextButton.icon(onPressed: () => openMap(context, addr), icon: const Icon(Icons.map_rounded, size: 18, color: C.purple), label: const Text('الخريطة', style: TextStyle(color: C.purple))),
+          if (phone.isNotEmpty) TextButton.icon(onPressed: () => sendWa(context, phone, 'مرحباً ${o['customerName'] ?? ''} 🌿 أنا الكابتن ${cloud.name ?? ''} من ${o['store'] ?? 'المتجر'}، في الطريق إليك بطلبك #$id.'), icon: const Icon(Icons.chat_rounded, size: 18, color: C.wa), label: const Text('واتساب', style: TextStyle(color: C.wa))),
+        ]),
+        if (st == 'new' || st == 'prep') ...[
+          const SizedBox(height: 6),
+          LuxButton('بدأت التوصيل', Icons.two_wheeler_rounded, busy ? null : () => _set(o, 'delivery'), colors: const [Color(0xFF5B21B6), C.purple]),
+        ] else if (st == 'delivery') ...[
+          const SizedBox(height: 6),
+          LuxButton('تم التسليم', Icons.check_circle_rounded, busy
+              ? null
+              : () async {
+                  if (await confirmDialog(context, 'تأكيد تسليم الطلب #$id للعميل؟', yes: 'تم التسليم')) _set(o, 'done');
+                }, colors: const [Color(0xFF1F6F43), C.g2]),
+        ],
+      ]),
+    );
+  }
+
+  Widget _stat(String t, String v, Color col) => Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(color: col.withOpacity(.09), borderRadius: BorderRadius.circular(16)),
+        child: Row(children: [
+          Expanded(child: Text(t, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13))),
+          Text(v, style: TextStyle(color: col, fontWeight: FontWeight.w900, fontSize: 18)),
+        ]),
+      );
+
+  Widget _account() {
+    final cash = _d(stats?['cashDue']);
+    final credit = _d(stats?['creditDue']);
+    final net = _d(stats?['net']);
+    final at = DateTime.tryParse('${stats?['at']}');
+    return ListView(padding: const EdgeInsets.all(14), children: [
+      LuxCard(
+        child: Row(children: [
+          const CircleAvatar(radius: 26, backgroundColor: Color(0xFFEAF4ED), child: Icon(Icons.two_wheeler_rounded, color: C.g, size: 28)),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(cloud.name ?? 'كابتن', style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 17)),
+              const Text('كابتن توصيل', style: TextStyle(color: C.muted, fontSize: 12)),
+            ]),
+          ),
+        ]),
+      ),
+      const PageHead('كشف حسابي'),
+      if (stats == null)
+        const LuxCard(child: Empty('لم يصل كشف الحساب بعد', icon: Icons.account_balance_wallet_outlined))
+      else ...[
+        _stat('عليّ للمحل (توريد)', money(cash), cash > 0 ? C.red : C.g2),
+        const SizedBox(height: 8),
+        _stat('لي عند المحل', money(credit), credit > 0 ? C.purple : C.g2),
+        const SizedBox(height: 8),
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(gradient: C.brandGradient, borderRadius: BorderRadius.circular(18), border: Border.all(color: C.gold.withOpacity(.6))),
+          child: Column(children: [
+            Text(net > 0 ? 'الصافي: لي على المحل' : net < 0 ? 'الصافي: عليّ للمحل' : 'الحساب متساوٍ', style: const TextStyle(color: Colors.white70)),
+            const SizedBox(height: 4),
+            Text(money(net.abs()), style: const TextStyle(color: Color(0xFFFFE58B), fontSize: 26, fontWeight: FontWeight.w900)),
+          ]),
+        ),
+        if (at != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text('آخر تحديث: ${dateText(at)}', textAlign: TextAlign.center, style: const TextStyle(color: C.muted, fontSize: 11))),
+      ],
+      const SizedBox(height: 20),
+      OutlinedButton.icon(
+        onPressed: () async {
+          if (await confirmDialog(context, 'تسجيل الخروج من حساب الكابتن؟', yes: 'خروج')) {
+            await cloud.logout();
+          }
+        },
+        icon: const Icon(Icons.logout_rounded, color: C.red),
+        label: const Text('تسجيل الخروج', style: TextStyle(color: C.red)),
+      ),
+    ]);
   }
 }
