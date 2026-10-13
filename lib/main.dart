@@ -8,6 +8,7 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
@@ -15,10 +16,17 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'cloud_config.dart';
+
+part 'p_extra.dart';
+
+/// رقم البناء (يُحقن من GitHub Actions)
+const int kBuild = int.fromEnvironment('BUILD', defaultValue: 0);
 
 // ====================================================================
 //  أدوات عامة
@@ -48,6 +56,7 @@ String statusLabel(String s) => switch (s) {
 String paymentLabel(String m) => switch (m) {
       'cod' => 'عند الاستلام',
       'partial' => 'دفعة مقدمة + الباقي عند الاستلام',
+      'credit' => 'آجل (على حساب العميل)',
       _ => 'مدفوع بالكامل (شامل التوصيل)',
     };
 
@@ -56,6 +65,7 @@ String paymentLabel(String m) => switch (m) {
 // ====================================================================
 
 File? _dataFile;
+Directory? _imgDir;
 Future<void> _writeChain = Future.value();
 
 /// يقرأ البيانات المحفوظة من ذاكرة التطبيق (يُستدعى مرة واحدة عند التشغيل)
@@ -63,31 +73,77 @@ Future<String?> loadPersisted() async {
   try {
     final d = await getApplicationDocumentsDirectory();
     _dataFile = File('${d.path}/salad_bar_data.json');
+    _imgDir = Directory('${d.path}/img');
+    if (!await _imgDir!.exists()) await _imgDir!.create(recursive: true);
+    final tmp = File('${_dataFile!.path}.tmp');
+    if (!await _dataFile!.exists() && await tmp.exists()) {
+      await tmp.rename(_dataFile!.path);
+    }
     if (await _dataFile!.exists()) return await _dataFile!.readAsString();
   } catch (_) {}
   return null;
 }
 
+/// كتابة آمنة (ملف مؤقت ثم استبدال) ومتسلسلة
 void _persist(String s) {
   final f = _dataFile;
   if (f == null) return;
   _writeChain = _writeChain.then((_) async {
     try {
-      await f.writeAsString(s, flush: true);
+      final tmp = File('${f.path}.tmp');
+      await tmp.writeAsString(s, flush: true);
+      await tmp.rename(f.path);
     } catch (_) {}
   });
 }
 
 final ImagePicker _picker = ImagePicker();
 
-/// اختيار صورة (معرض أو كاميرا) مع تصغيرها وإرجاعها كـ data URL
-Future<String?> pickImageData({int maxSide = 600, bool png = false, bool camera = false}) async {
+Future<String> saveImageBytes(Uint8List b, {String ext = 'jpg'}) async {
+  var dir = _imgDir;
+  if (dir == null) {
+    final d = await getApplicationDocumentsDirectory();
+    dir = Directory('${d.path}/img');
+    _imgDir = dir;
+  }
+  if (!await dir.exists()) await dir.create(recursive: true);
+  final f = File('${dir.path}/${DateTime.now().microsecondsSinceEpoch}.$ext');
+  await f.writeAsBytes(b, flush: true);
+  return f.path;
+}
+
+Future<String?> saveDataUrl(String dataUrl) async {
+  try {
+    final i = dataUrl.indexOf(',');
+    final head = dataUrl.substring(0, i);
+    final bytes = base64Decode(dataUrl.substring(i + 1));
+    return await saveImageBytes(Uint8List.fromList(bytes), ext: head.contains('png') ? 'png' : 'jpg');
+  } catch (_) {
+    return null;
+  }
+}
+
+/// يحوّل مسار ملف صورة إلى data URL (للنسخ الاحتياطي والإرسال)
+Future<String?> fileToDataUrl(String path) async {
+  try {
+    if (path.startsWith('data:') || path.startsWith('http')) return path;
+    final f = File(path);
+    if (!await f.exists()) return null;
+    final b = await f.readAsBytes();
+    return 'data:${path.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg'};base64,${base64Encode(b)}';
+  } catch (_) {
+    return null;
+  }
+}
+
+/// اختيار صورة (معرض أو كاميرا) وتصغيرها وإرجاعها data URL
+Future<String?> pickImageAsDataUrl({int maxSide = 600, bool camera = false, int quality = 85}) async {
   try {
     final x = await _picker.pickImage(
       source: camera ? ImageSource.camera : ImageSource.gallery,
       maxWidth: maxSide.toDouble(),
       maxHeight: maxSide.toDouble(),
-      imageQuality: 85,
+      imageQuality: quality,
     );
     if (x == null) return null;
     final b = await x.readAsBytes();
@@ -96,6 +152,12 @@ Future<String?> pickImageData({int maxSide = 600, bool png = false, bool camera 
   } catch (_) {
     return null;
   }
+}
+
+/// اختيار صورة وحفظها كملف داخل التطبيق وإرجاع مساره
+Future<String?> pickImageData({int maxSide = 600, bool png = false, bool camera = false}) async {
+  final d = await pickImageAsDataUrl(maxSide: maxSide, camera: camera);
+  return d == null ? null : await saveDataUrl(d);
 }
 
 Future<String?> pickTextFile() async {
@@ -181,88 +243,156 @@ Widget imgWidget(String? path, {BoxFit fit = BoxFit.cover, required Widget fallb
     return Image.memory(bytes,
         fit: fit, gaplessPlayback: true, width: double.infinity, height: double.infinity, errorBuilder: (_, __, ___) => fallback);
   }
-  return Image.network(path,
+  if (path.startsWith('http')) {
+    return Image.network(path,
+        fit: fit,
+        width: double.infinity,
+        height: double.infinity,
+        errorBuilder: (_, __, ___) => fallback,
+        loadingBuilder: (c, child, p) => p == null ? child : fallback);
+  }
+  return Image.file(File(path),
       fit: fit,
+      gaplessPlayback: true,
       width: double.infinity,
       height: double.infinity,
-      errorBuilder: (_, __, ___) => fallback,
-      loadingBuilder: (c, child, p) => p == null ? child : fallback);
+      cacheWidth: 700,
+      errorBuilder: (_, __, ___) => fallback);
 }
+
 
 // ====================================================================
 //  النماذج
 // ====================================================================
 
+String _newSalt() => base64Encode(List<int>.generate(12, (_) => Random.secure().nextInt(256)));
+
+String hashPw(String pw, String salt) {
+  List<int> d = utf8.encode('$salt:$pw');
+  for (var i = 0; i < 5000; i++) {
+    d = sha256.convert(d).bytes;
+  }
+  return base64Encode(d);
+}
+
+DateTime? _dt(dynamic v) => v == null ? null : DateTime.tryParse('$v');
+
 class AppSettings {
-  String username, password, storeName, storePhone, storeAddress, ownerName;
+  String username, storeName, storePhone, storeAddress, ownerName;
+  String passHash, passSalt;
+  bool mustChange;
   String? logoPath, ownerImage;
+  double loyaltyEarn, loyaltyValue; // earn: كل كم ريال = نقطة (0 = معطّل) ، value: قيمة النقطة بالريال
+  String menuUrl;
   AppSettings({
     this.username = 'admin',
-    this.password = '1234',
+    this.passHash = '',
+    this.passSalt = '',
+    this.mustChange = true,
     this.storeName = 'سلطة بار',
     this.storePhone = '',
     this.storeAddress = '',
     this.ownerName = 'صاحب المتجر',
     this.logoPath,
     this.ownerImage,
+    this.loyaltyEarn = 0,
+    this.loyaltyValue = 50,
+    this.menuUrl = '',
   });
+  void setPassword(String pw) {
+    passSalt = _newSalt();
+    passHash = hashPw(pw, passSalt);
+  }
+
+  bool checkPassword(String pw) => passHash.isNotEmpty && hashPw(pw, passSalt) == passHash;
+
   Map<String, dynamic> toJson() => {
         'username': username,
-        'password': password,
+        'passHash': passHash,
+        'passSalt': passSalt,
+        'mustChange': mustChange,
         'storeName': storeName,
         'storePhone': storePhone,
         'storeAddress': storeAddress,
         'ownerName': ownerName,
         'logoPath': logoPath,
         'ownerImage': ownerImage,
+        'loyaltyEarn': loyaltyEarn,
+        'loyaltyValue': loyaltyValue,
+        'menuUrl': menuUrl,
       };
-  factory AppSettings.fromJson(Map<String, dynamic> j) => AppSettings(
-        username: j['username'] ?? 'admin',
-        password: j['password'] ?? '1234',
-        storeName: j['storeName'] ?? 'سلطة بار',
-        storePhone: j['storePhone'] ?? '',
-        storeAddress: j['storeAddress'] ?? '',
-        ownerName: j['ownerName'] ?? 'صاحب المتجر',
-        logoPath: j['logoPath'],
-        ownerImage: j['ownerImage'],
-      );
+  factory AppSettings.fromJson(Map<String, dynamic> j) {
+    final s = AppSettings(
+      username: j['username'] ?? 'admin',
+      storeName: j['storeName'] ?? 'سلطة بار',
+      storePhone: j['storePhone'] ?? '',
+      storeAddress: j['storeAddress'] ?? '',
+      ownerName: j['ownerName'] ?? 'صاحب المتجر',
+      logoPath: j['logoPath'],
+      ownerImage: j['ownerImage'],
+      loyaltyEarn: _d(j['loyaltyEarn']),
+      loyaltyValue: j['loyaltyValue'] == null ? 50 : _d(j['loyaltyValue']),
+      menuUrl: j['menuUrl'] ?? '',
+    );
+    if ('${j['passHash'] ?? ''}'.isNotEmpty) {
+      s.passHash = '${j['passHash']}';
+      s.passSalt = '${j['passSalt'] ?? ''}';
+      s.mustChange = j['mustChange'] ?? false;
+    } else {
+      // بيانات قديمة بكلمة مرور نصية: تُحوَّل إلى تجزئة
+      final legacy = '${j['password'] ?? '1234'}';
+      s.setPassword(legacy);
+      s.mustChange = legacy == '1234';
+    }
+    return s;
+  }
 }
 
 class Product {
   int id;
   String name, unit;
-  double price, stock, lowStock;
-  bool active;
+  double price, cost, stock, lowStock;
+  bool active, track;
   String? imagePath;
   Product({
     required this.id,
     required this.name,
     required this.price,
+    this.cost = 0,
     this.unit = 'piece',
     this.stock = 0,
     this.lowStock = 10,
     this.active = true,
+    this.track = true,
     this.imagePath,
   });
   bool get isPiece => unit == 'piece';
+
+  /// الحد الأقصى المتاح للبيع (غير محدود إن لم يُتتبع المخزون)
+  double get maxQty => track ? stock : double.infinity;
   Map<String, dynamic> toJson() => {
         'id': id,
         'name': name,
         'price': price,
+        'cost': cost,
         'unit': unit,
         'stock': stock,
         'lowStock': lowStock,
         'active': active,
+        'track': track,
         'imagePath': imagePath,
       };
   factory Product.fromJson(Map<String, dynamic> j) => Product(
         id: j['id'],
         name: j['name'],
         price: _d(j['price']),
+        cost: _d(j['cost']),
         unit: j['unit'] ?? 'piece',
         stock: _d(j['stock']),
         lowStock: _d(j['lowStock']),
         active: j['active'] ?? true,
+        // البيانات القديمة بمخزون وهمي 999 لا تُتتبَّع
+        track: j['track'] ?? (_d(j['stock']) != 999),
         imagePath: j['imagePath'],
       );
 }
@@ -302,14 +432,16 @@ class Captain {
 class OrderItem {
   int productId;
   String name, unit;
-  double price, qty;
-  OrderItem({required this.productId, required this.name, required this.price, required this.unit, required this.qty});
+  double price, cost, qty;
+  OrderItem({required this.productId, required this.name, required this.price, this.cost = 0, required this.unit, required this.qty});
   double get lineTotal => price * qty * unitFactor(unit);
-  Map<String, dynamic> toJson() => {'productId': productId, 'name': name, 'price': price, 'unit': unit, 'qty': qty};
+  double get lineCost => cost * qty * unitFactor(unit);
+  Map<String, dynamic> toJson() => {'productId': productId, 'name': name, 'price': price, 'cost': cost, 'unit': unit, 'qty': qty};
   factory OrderItem.fromJson(Map<String, dynamic> j) => OrderItem(
         productId: j['productId'],
         name: j['name'],
         price: _d(j['price']),
+        cost: _d(j['cost']),
         unit: j['unit'] ?? 'piece',
         qty: _d(j['qty']),
       );
@@ -320,8 +452,11 @@ class Order {
   DateTime date;
   List<OrderItem> items;
   double subtotal, delivery, discount, total;
-  double goodsTotal, paidNow, goodsDue, captainCredit;
-  String notes, status, method;
+  double goodsTotal, paidNow, goodsDue, captainCredit, pointsUsed;
+  String notes, status, method, coupon, source;
+  DateTime? startAt, doneAt;
+  String? proof;
+  double? proofLat, proofLng;
   Order({
     required this.id,
     required this.date,
@@ -336,15 +471,29 @@ class Order {
     required this.paidNow,
     required this.goodsDue,
     this.captainCredit = 0,
+    this.pointsUsed = 0,
     this.notes = '',
     this.status = 'new',
     this.method = 'prepaid',
+    this.coupon = '',
+    this.source = 'app',
+    this.startAt,
+    this.doneAt,
+    this.proof,
+    this.proofLat,
+    this.proofLng,
   });
 
-  /// المبلغ المطلوب تحصيله من العميل عند الاستلام (متبقي الأصناف + التوصيل)
-  /// المحاسَب بالكامل = الأصناف + التوصيل مدفوعان، فلا يُطلب من العميل شيء
-  double get customerDue => method == 'prepaid' ? 0 : goodsDue + delivery;
-  double get paidAmount => method == 'prepaid' ? total : paidNow;
+  /// الكابتن لا يحصّل شيئاً من العميل (مدفوع بالكامل أو آجل)
+  bool get isFree => method == 'prepaid' || method == 'credit';
+
+  /// المبلغ المطلوب تحصيله من العميل عند الاستلام
+  double get customerDue => isFree ? 0 : goodsDue + delivery;
+  double get paidAmount => method == 'prepaid' ? total : (method == 'credit' ? 0 : paidNow);
+
+  /// دَين على العميل للمحل (الطلب الآجل)
+  double get debt => method == 'credit' ? total : 0;
+  double get cogs => items.fold<double>(0, (a, i) => a + i.lineCost);
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -360,9 +509,17 @@ class Order {
         'paidNow': paidNow,
         'goodsDue': goodsDue,
         'captainCredit': captainCredit,
+        'pointsUsed': pointsUsed,
         'notes': notes,
         'status': status,
         'method': method,
+        'coupon': coupon,
+        'source': source,
+        'startAt': startAt?.toIso8601String(),
+        'doneAt': doneAt?.toIso8601String(),
+        'proof': proof,
+        'proofLat': proofLat,
+        'proofLng': proofLng,
       };
   factory Order.fromJson(Map<String, dynamic> j) => Order(
         id: j['id'],
@@ -378,9 +535,17 @@ class Order {
         paidNow: _d(j['paidNow']),
         goodsDue: _d(j['goodsDue']),
         captainCredit: _d(j['captainCredit']),
+        pointsUsed: _d(j['pointsUsed']),
         notes: j['notes'] ?? '',
         status: j['status'] ?? 'new',
         method: j['method'] ?? 'prepaid',
+        coupon: j['coupon'] ?? '',
+        source: j['source'] ?? 'app',
+        startAt: _dt(j['startAt']),
+        doneAt: _dt(j['doneAt']),
+        proof: j['proof'],
+        proofLat: j['proofLat'] == null ? null : _d(j['proofLat']),
+        proofLng: j['proofLng'] == null ? null : _d(j['proofLng']),
       );
 }
 
@@ -402,12 +567,13 @@ class Settlement {
       );
 }
 
-/// مشتريات خارجية يكلّف بها المحل الكابتن (يسلّمه عهدة ثم يسجّل التكلفة الفعلية)
+/// مشتريات خارجية يكلّف بها المحل الكابتن (يسلّمه عهدة ثم تُسجَّل التكلفة الفعلية)
 class Purchase {
   int id, captainId;
-  String title, note;
-  double given, actual;
-  bool closed;
+  String title, note, claimNote;
+  double given, actual, claimed;
+  bool closed, pending; // pending = أرسل الكابتن التكلفة وينتظر اعتماد المالك
+  String? receipt;
   DateTime date;
   Purchase({
     required this.id,
@@ -415,8 +581,12 @@ class Purchase {
     required this.title,
     required this.given,
     this.actual = 0,
+    this.claimed = 0,
     this.note = '',
+    this.claimNote = '',
     this.closed = false,
+    this.pending = false,
+    this.receipt,
     required this.date,
   });
   Map<String, dynamic> toJson() => {
@@ -424,9 +594,13 @@ class Purchase {
         'captainId': captainId,
         'title': title,
         'note': note,
+        'claimNote': claimNote,
         'given': given,
         'actual': actual,
+        'claimed': claimed,
         'closed': closed,
+        'pending': pending,
+        'receipt': receipt,
         'date': date.toIso8601String(),
       };
   factory Purchase.fromJson(Map<String, dynamic> j) => Purchase(
@@ -434,10 +608,133 @@ class Purchase {
         captainId: j['captainId'],
         title: j['title'] ?? '',
         note: j['note'] ?? '',
+        claimNote: j['claimNote'] ?? '',
         given: _d(j['given']),
         actual: _d(j['actual']),
+        claimed: _d(j['claimed']),
         closed: j['closed'] ?? false,
+        pending: j['pending'] ?? false,
+        receipt: j['receipt'],
         date: DateTime.parse(j['date']),
+      );
+}
+
+class Expense {
+  int id;
+  String title, category, note;
+  double amount;
+  DateTime date;
+  Expense({required this.id, required this.title, required this.category, required this.amount, this.note = '', required this.date});
+  Map<String, dynamic> toJson() =>
+      {'id': id, 'title': title, 'category': category, 'amount': amount, 'note': note, 'date': date.toIso8601String()};
+  factory Expense.fromJson(Map<String, dynamic> j) => Expense(
+        id: j['id'],
+        title: j['title'] ?? '',
+        category: j['category'] ?? 'أخرى',
+        amount: _d(j['amount']),
+        note: j['note'] ?? '',
+        date: DateTime.parse(j['date']),
+      );
+}
+
+class CustomerPayment {
+  int id, customerId;
+  double amount;
+  String note;
+  DateTime date;
+  CustomerPayment({required this.id, required this.customerId, required this.amount, this.note = '', required this.date});
+  Map<String, dynamic> toJson() => {'id': id, 'customerId': customerId, 'amount': amount, 'note': note, 'date': date.toIso8601String()};
+  factory CustomerPayment.fromJson(Map<String, dynamic> j) => CustomerPayment(
+        id: j['id'],
+        customerId: j['customerId'],
+        amount: _d(j['amount']),
+        note: j['note'] ?? '',
+        date: DateTime.parse(j['date']),
+      );
+}
+
+class StockMove {
+  int id, productId;
+  double delta, balance;
+  String type, note;
+  DateTime date;
+  StockMove({required this.id, required this.productId, required this.delta, required this.balance, required this.type, this.note = '', required this.date});
+  Map<String, dynamic> toJson() =>
+      {'id': id, 'productId': productId, 'delta': delta, 'balance': balance, 'type': type, 'note': note, 'date': date.toIso8601String()};
+  factory StockMove.fromJson(Map<String, dynamic> j) => StockMove(
+        id: j['id'],
+        productId: j['productId'],
+        delta: _d(j['delta']),
+        balance: _d(j['balance']),
+        type: j['type'] ?? '',
+        note: j['note'] ?? '',
+        date: DateTime.parse(j['date']),
+      );
+}
+
+class DayClose {
+  int id;
+  String day, note;
+  double expected, actual;
+  DateTime at;
+  DayClose({required this.id, required this.day, required this.expected, required this.actual, this.note = '', required this.at});
+  double get diff => actual - expected;
+  Map<String, dynamic> toJson() =>
+      {'id': id, 'day': day, 'expected': expected, 'actual': actual, 'note': note, 'at': at.toIso8601String()};
+  factory DayClose.fromJson(Map<String, dynamic> j) => DayClose(
+        id: j['id'],
+        day: j['day'] ?? '',
+        expected: _d(j['expected']),
+        actual: _d(j['actual']),
+        note: j['note'] ?? '',
+        at: DateTime.parse(j['at']),
+      );
+}
+
+class Coupon {
+  int id;
+  String code, type; // fixed | percent
+  double value, minOrder;
+  int maxUses;
+  DateTime? expires;
+  bool active;
+  Coupon({required this.id, required this.code, this.type = 'fixed', required this.value, this.minOrder = 0, this.maxUses = 0, this.expires, this.active = true});
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'code': code,
+        'type': type,
+        'value': value,
+        'minOrder': minOrder,
+        'maxUses': maxUses,
+        'expires': expires?.toIso8601String(),
+        'active': active,
+      };
+  factory Coupon.fromJson(Map<String, dynamic> j) => Coupon(
+        id: j['id'],
+        code: j['code'] ?? '',
+        type: j['type'] ?? 'fixed',
+        value: _d(j['value']),
+        minOrder: _d(j['minOrder']),
+        maxUses: _d(j['maxUses']).toInt(),
+        expires: _dt(j['expires']),
+        active: j['active'] ?? true,
+      );
+}
+
+class StaffUser {
+  int id;
+  String name, username, passHash, passSalt, role;
+  StaffUser({required this.id, required this.name, required this.username, required this.passHash, required this.passSalt, this.role = 'cashier'});
+  bool check(String pw) => hashPw(pw, passSalt) == passHash;
+  Map<String, dynamic> toJson() =>
+      {'id': id, 'name': name, 'username': username, 'passHash': passHash, 'passSalt': passSalt, 'role': role};
+  factory StaffUser.fromJson(Map<String, dynamic> j) => StaffUser(
+        id: j['id'],
+        name: j['name'] ?? '',
+        username: j['username'] ?? '',
+        passHash: j['passHash'] ?? '',
+        passSalt: j['passSalt'] ?? '',
+        role: j['role'] ?? 'cashier',
       );
 }
 
@@ -976,8 +1273,17 @@ void toastGlobal(String m) {
     ));
 }
 
+/// تنبيه صوتي واهتزاز عند وصول شيء مهم
+void alertSound() {
+  try {
+    SystemSound.play(SystemSoundType.alert);
+    HapticFeedback.heavyImpact();
+  } catch (_) {}
+}
+
 String cKey(int id) => 'c$id';
 String oKey(int id) => 'o$id';
+String pKey(int id) => 'p$id';
 int _keyNum(String k) => int.tryParse(k.length > 1 ? k.substring(1) : '') ?? 0;
 bool _ok(http.Response? r) => r != null && r.statusCode >= 200 && r.statusCode < 300;
 
@@ -1020,18 +1326,20 @@ String fbErr(String m) {
 }
 
 class CloudService extends ChangeNotifier {
-  String? email, password, uid, role, captainKey, name;
+  String? email, uid, role, captainKey, name, refreshToken;
   String? _token;
   DateTime _exp = DateTime(2000);
   File? _file;
   String? _ordersEtag;
   Map<String, dynamic>? _ordersCache;
+  Map<String, dynamic>? updateInfo;
 
   bool get configured => !kFbApiKey.startsWith('PASTE') && !kFbDbUrl.startsWith('PASTE');
   bool get signedIn => uid != null && role != null;
   bool get isOwner => signedIn && role == 'owner';
   bool get isCaptain => signedIn && role == 'captain';
   int get captainId => _keyNum(captainKey ?? 'c0');
+  String get _base => kFbDbUrl.replaceAll(RegExp(r'/+$'), '');
 
   Future<void> load() async {
     try {
@@ -1040,11 +1348,16 @@ class CloudService extends ChangeNotifier {
       if (await _file!.exists()) {
         final j = jsonDecode(await _file!.readAsString()) as Map<String, dynamic>;
         email = j['email'];
-        password = j['password'];
         uid = j['uid'];
         role = j['role'];
         captainKey = j['captainKey'];
         name = j['name'];
+        refreshToken = j['refreshToken'];
+        // جلسة قديمة بلا رمز تجديد: تُعتبر منتهية
+        if (refreshToken == null) {
+          uid = null;
+          role = null;
+        }
       }
     } catch (_) {}
   }
@@ -1057,14 +1370,14 @@ class CloudService extends ChangeNotifier {
         if (await f.exists()) await f.delete();
       } else {
         await f.writeAsString(
-            jsonEncode({'email': email, 'password': password, 'uid': uid, 'role': role, 'captainKey': captainKey, 'name': name}),
+            jsonEncode({'email': email, 'uid': uid, 'role': role, 'captainKey': captainKey, 'name': name, 'refreshToken': refreshToken}),
             flush: true);
       }
     } catch (_) {}
   }
 
   Future<void> logout() async {
-    email = password = uid = role = captainKey = name = null;
+    email = uid = role = captainKey = name = refreshToken = null;
     _token = null;
     _ordersEtag = null;
     _ordersCache = null;
@@ -1088,38 +1401,78 @@ class CloudService extends ChangeNotifier {
       _token = j['idToken'] as String;
       _exp = DateTime.now().add(Duration(seconds: int.tryParse('${j['expiresIn']}') ?? 3600));
       uid = j['localId'] as String;
+      refreshToken = j['refreshToken'] as String?;
       email = em;
-      password = pw;
       return null;
     } catch (_) {
       return 'تعذّر الاتصال بالإنترنت';
     }
   }
 
+  /// تجديد الجلسة برمز التجديد (لا نخزّن كلمة المرور على الجهاز)
+  Future<bool> _refresh() async {
+    final rt = refreshToken;
+    if (rt == null) return false;
+    try {
+      final r = await http
+          .post(Uri.parse('https://securetoken.googleapis.com/v1/token?key=$kFbApiKey'),
+              headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: 'grant_type=refresh_token&refresh_token=$rt')
+          .timeout(const Duration(seconds: 20));
+      final j = jsonDecode(r.body);
+      if (j is Map && j['id_token'] != null) {
+        _token = '${j['id_token']}';
+        _exp = DateTime.now().add(Duration(seconds: int.tryParse('${j['expires_in']}') ?? 3600));
+        if (j['refresh_token'] != null) refreshToken = '${j['refresh_token']}';
+        await _store();
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
   Future<String?> _tok() async {
     if (_token != null && DateTime.now().isBefore(_exp.subtract(const Duration(minutes: 2)))) return _token;
-    if (email == null || password == null) return null;
-    final e = await _signInRaw(email!, password!);
-    return e == null ? _token : null;
+    if (await _refresh()) return _token;
+    return null;
   }
 
   // ---- قاعدة البيانات ----
-  Future<http.Response?> _db(String method, String path, {Object? body, Map<String, String>? q, Map<String, String>? hdr}) async {
-    final t = await _tok();
-    if (t == null) return null;
-    final base = kFbDbUrl.replaceAll(RegExp(r'/+$'), '');
-    final uri = Uri.parse('$base/$path.json').replace(queryParameters: {'auth': t, ...?q});
-    final h = <String, String>{'Content-Type': 'application/json', ...?hdr};
+  Future<http.Response?> _req(String method, Uri uri, Object? body, Map<String, String> h) async {
     try {
       final Future<http.Response> f = switch (method) {
         'GET' => http.get(uri, headers: h),
         'PUT' => http.put(uri, headers: h, body: jsonEncode(body)),
+        'POST' => http.post(uri, headers: h, body: jsonEncode(body)),
         'DELETE' => http.delete(uri, headers: h),
         _ => http.patch(uri, headers: h, body: jsonEncode(body)),
       };
-      return await f.timeout(const Duration(seconds: 20));
+      return await f.timeout(const Duration(seconds: 25));
     } catch (_) {
       return null;
+    }
+  }
+
+  Future<http.Response?> _db(String method, String path, {Object? body, Map<String, String>? q, Map<String, String>? hdr}) async {
+    final t = await _tok();
+    if (t == null) return null;
+    final uri = Uri.parse('$_base/$path.json').replace(queryParameters: {'auth': t, ...?q});
+    return _req(method, uri, body, <String, String>{'Content-Type': 'application/json', ...?hdr});
+  }
+
+  /// طلب عام بدون مصادقة (القائمة والتحديثات)
+  Future<http.Response?> _pub(String method, String path, {Object? body}) async {
+    if (!configured) return null;
+    return _req(method, Uri.parse('$_base/$path.json'), body, {'Content-Type': 'application/json'});
+  }
+
+  Future<void> checkUpdate() async {
+    final r = await _pub('GET', 'meta');
+    if (_ok(r)) {
+      final j = jsonDecode(r!.body);
+      if (j is Map) {
+        updateInfo = Map<String, dynamic>.from(j);
+        notifyListeners();
+      }
     }
   }
 
@@ -1197,7 +1550,16 @@ class CloudService extends ChangeNotifier {
         if (v is Map) {
           v.forEach((ok2, d) {
             if (d is Map) {
-              out.add({'cid': _keyNum('$ck'), 'oid': _keyNum('$ok2'), 'status': '${d['status']}', 'name': '${d['name'] ?? ''}'});
+              out.add({
+                'cid': _keyNum('$ck'),
+                'oid': _keyNum('$ok2'),
+                'status': '${d['status']}',
+                'name': '${d['name'] ?? ''}',
+                'at': d['at'],
+                'proof': d['proof'],
+                'lat': d['lat'],
+                'lng': d['lng'],
+              });
             }
           });
         }
@@ -1207,6 +1569,76 @@ class CloudService extends ChangeNotifier {
   }
 
   Future<bool> deleteInbox(int cid, int oid) async => _ok(await _db('DELETE', 'inbox/${cKey(cid)}/${oKey(oid)}'));
+
+  // ---- المشتريات الخارجية ----
+  Future<bool> putPurchase(int cid, int pid, Map<String, dynamic> data) async =>
+      _ok(await _db('PUT', 'captainPurchases/${cKey(cid)}/${pKey(pid)}', body: data));
+
+  Future<bool> deletePurchase(int cid, int pid) async => _ok(await _db('DELETE', 'captainPurchases/${cKey(cid)}/${pKey(pid)}'));
+
+  Future<List<Map<String, dynamic>>?> fetchPurchaseInbox() async {
+    final r = await _db('GET', 'purchaseInbox');
+    if (!_ok(r)) return null;
+    final j = jsonDecode(r!.body);
+    final out = <Map<String, dynamic>>[];
+    if (j is Map) {
+      j.forEach((ck, v) {
+        if (v is Map) {
+          v.forEach((pk, d) {
+            if (d is Map) {
+              out.add({
+                'cid': _keyNum('$ck'),
+                'pid': _keyNum('$pk'),
+                'actual': d['actual'],
+                'note': '${d['note'] ?? ''}',
+                'receipt': d['receipt'],
+                'at': d['at'],
+              });
+            }
+          });
+        }
+      });
+    }
+    return out;
+  }
+
+  Future<bool> deletePurchaseInbox(int cid, int pid) async => _ok(await _db('DELETE', 'purchaseInbox/${cKey(cid)}/${pKey(pid)}'));
+
+  // ---- القائمة الإلكترونية ----
+  Future<bool> publishMenu(Map<String, dynamic> menu) async => _ok(await _db('PUT', 'menu', body: menu));
+
+  Future<List<Map<String, dynamic>>?> fetchPublicOrders() async {
+    final r = await _db('GET', 'publicOrders');
+    if (!_ok(r)) return null;
+    final j = jsonDecode(r!.body);
+    final out = <Map<String, dynamic>>[];
+    if (j is Map) {
+      j.forEach((k, v) {
+        if (v is Map) out.add({...Map<String, dynamic>.from(v), '_key': '$k'});
+      });
+    }
+    return out;
+  }
+
+  Future<bool> deletePublicOrder(String key) async => _ok(await _db('DELETE', 'publicOrders/$key'));
+
+  // ---- النسخ الاحتياطي ----
+  Future<bool> putBackup(String data) async =>
+      _ok(await _db('PUT', 'backups/$uid', body: {'at': DateTime.now().toIso8601String(), 'size': data.length, 'data': data}));
+
+  Future<Map<String, dynamic>?> getBackup() async {
+    final r = await _db('GET', 'backups/$uid');
+    if (!_ok(r)) return null;
+    final j = jsonDecode(r!.body);
+    return j is Map ? Map<String, dynamic>.from(j) : <String, dynamic>{};
+  }
+
+  Future<String?> backupTime() async {
+    final r = await _db('GET', 'backups/$uid/at');
+    if (!_ok(r)) return null;
+    final j = jsonDecode(r!.body);
+    return j is String ? j : null;
+  }
 
   // ---- الكابتن ----
   Future<String?> captainLogin(String login, String pw) async {
@@ -1234,7 +1666,8 @@ class CloudService extends ChangeNotifier {
   /// null = فشل الاتصال، {} = لا توجد طلبات
   Future<Map<String, dynamic>?> fetchMyOrders() async {
     if (captainKey == null) return null;
-    final r = await _db('GET', 'captainOrders/$captainKey', hdr: {'X-Firebase-ETag': 'true', if (_ordersEtag != null) 'if-none-match': _ordersEtag!});
+    final r = await _db('GET', 'captainOrders/$captainKey',
+        hdr: {'X-Firebase-ETag': 'true', if (_ordersEtag != null) 'if-none-match': _ordersEtag!});
     if (r == null) return null;
     if (r.statusCode == 304) return _ordersCache ?? {};
     if (!_ok(r)) return null;
@@ -1250,14 +1683,63 @@ class CloudService extends ChangeNotifier {
     return _asMap(jsonDecode(r!.body));
   }
 
-  Future<bool> captainSetStatus(int oid, String status) async {
+  Future<Map<String, dynamic>?> fetchMyPurchases() async {
+    if (captainKey == null) return null;
+    final r = await _db('GET', 'captainPurchases/$captainKey');
+    if (!_ok(r)) return null;
+    return _asMap(jsonDecode(r!.body));
+  }
+
+  Future<bool> captainSetStatus(int oid, String status, {String? proof, double? lat, double? lng}) async {
     if (captainKey == null) return false;
-    final inbox = await _db('PUT', 'inbox/$captainKey/${oKey(oid)}',
-        body: {'status': status, 'at': DateTime.now().toIso8601String(), 'name': name ?? ''});
+    final inbox = await _db('PUT', 'inbox/$captainKey/${oKey(oid)}', body: {
+      'status': status,
+      'at': DateTime.now().toIso8601String(),
+      'name': name ?? '',
+      if (proof != null) 'proof': proof,
+      if (lat != null && lng != null) ...{'lat': lat, 'lng': lng},
+    });
     if (!_ok(inbox)) return false;
     await _db('PUT', 'captainOrders/$captainKey/${oKey(oid)}/status', body: status);
     _ordersEtag = null;
     return true;
+  }
+
+  Future<bool> submitPurchase(int pid, double actual, String note, String? receipt) async {
+    if (captainKey == null) return false;
+    return _ok(await _db('PUT', 'purchaseInbox/$captainKey/${pKey(pid)}', body: {
+      'actual': actual,
+      'note': note,
+      'at': DateTime.now().toIso8601String(),
+      'name': name ?? '',
+      if (receipt != null) 'receipt': receipt,
+    }));
+  }
+
+  // ---- فحص الاتصال ----
+  Future<List<String>> diagnose() async {
+    final out = <String>[];
+    if (!configured) return ['✗ لم تُضبط قيم Firebase في cloud_config.dart'];
+    out.add('✓ إعدادات Firebase موجودة');
+    if (!signedIn) {
+      out.add('✗ غير مسجّل الدخول (فعّل الربط أولاً)');
+      return out;
+    }
+    out.add('✓ مسجّل الدخول (${role == 'owner' ? 'مالك' : 'كابتن'})');
+    final t = await _tok();
+    out.add(t != null ? '✓ الجلسة صالحة' : '✗ تعذّر تجديد الجلسة، أعد الدخول');
+    if (t == null) return out;
+    final g = await _db('GET', 'users/$uid');
+    out.add(_ok(g) ? '✓ قراءة بيانات المستخدم' : '✗ رُفضت القراءة أو لا يوجد اتصال — راجع القواعد والرابط');
+    if (isOwner) {
+      final i = await _db('GET', 'inbox');
+      out.add(_ok(i) ? '✓ قراءة صندوق الكباتن' : '✗ تعذّرت قراءة صندوق الكباتن — حدّث القواعد');
+      final pu = await _db('GET', 'publicOrders');
+      out.add(_ok(pu) ? '✓ قراءة طلبات القائمة الإلكترونية' : '✗ تعذّرت قراءة طلبات القائمة — حدّث القواعد');
+    }
+    final m = await _pub('GET', 'meta');
+    out.add(_ok(m) ? '✓ قراءة معلومات الإصدار' : '✗ تعذّرت قراءة /meta — حدّث القواعد');
+    return out;
   }
 }
 
@@ -1283,6 +1765,9 @@ class AppStore extends ChangeNotifier {
   List<Order> orders = [];
   List<Settlement> settlements = [];
   List<Purchase> purchases = [];
+  List<CustomerPayment> customerPayments = [];
+  List<StockMove> stockMoves = [];
+  List<DayClose> closes = [];
   bool _captainsFixed = false;
   int _nP = 1, _nC = 1, _nCap = 1, _nO = 1;
 
@@ -1301,10 +1786,10 @@ class AppStore extends ChangeNotifier {
   }
 
   void _seed() {
-    settings = AppSettings(storeAddress: 'مكرونة مخلوطة .. طعم يرضيك');
+    settings = AppSettings(storeAddress: 'مكرونة مخلوطة .. طعم يرضيك')..setPassword('1234');
     products = [];
     _nP = 1;
-    void add(String n, double p) => products.add(Product(id: _nP++, name: n, price: p, stock: 999, lowStock: 10));
+    void add(String n, double p) => products.add(Product(id: _nP++, name: n, price: p, stock: 0, lowStock: 10, track: false));
     for (final f in ['عادي', 'ليمون', 'سبايسي']) {
       add('سلطة البار - $f - كبير', 1500);
       add('سلطة البار - $f - وسط', 800);
@@ -1325,6 +1810,9 @@ class AppStore extends ChangeNotifier {
     orders = [];
     settlements = [];
     purchases = [];
+    customerPayments = [];
+    stockMoves = [];
+    closes = [];
     _captainsFixed = true;
     _nC = 2;
     _nCap = 2;
@@ -1339,6 +1827,9 @@ class AppStore extends ChangeNotifier {
     orders = (j['orders'] as List).map((e) => Order.fromJson(Map<String, dynamic>.from(e))).toList();
     settlements = ((j['settlements'] ?? []) as List).map((e) => Settlement.fromJson(Map<String, dynamic>.from(e))).toList();
     purchases = ((j['purchases'] ?? []) as List).map((e) => Purchase.fromJson(Map<String, dynamic>.from(e))).toList();
+    customerPayments = ((j['customerPayments'] ?? []) as List).map((e) => CustomerPayment.fromJson(Map<String, dynamic>.from(e))).toList();
+    stockMoves = ((j['stockMoves'] ?? []) as List).map((e) => StockMove.fromJson(Map<String, dynamic>.from(e))).toList();
+    closes = ((j['closes'] ?? []) as List).map((e) => DayClose.fromJson(Map<String, dynamic>.from(e))).toList();
     _nP = (products.map((e) => e.id).fold(0, max)) + 1;
     _nC = (customers.map((e) => e.id).fold(0, max)) + 1;
     _nCap = (captains.map((e) => e.id).fold(0, max)) + 1;
@@ -1371,29 +1862,124 @@ class AppStore extends ChangeNotifier {
         'orders': orders.map((e) => e.toJson()).toList(),
         'settlements': settlements.map((e) => e.toJson()).toList(),
         'purchases': purchases.map((e) => e.toJson()).toList(),
+        'customerPayments': customerPayments.map((e) => e.toJson()).toList(),
+        'stockMoves': stockMoves.map((e) => e.toJson()).toList(),
+        'closes': closes.map((e) => e.toJson()).toList(),
         'captainsFixV1': _captainsFixed,
       };
 
+  Timer? _saveTimer, _backupTimer;
+  bool _needsFlush = false, _backupDirty = false;
+  DateTime? lastBackupAt;
+
+  /// حفظ مؤجّل (نصف ثانية) لتخفيف الكتابة، ويُفرَّغ فوراً عند إغلاق التطبيق
   void _save() {
-    _persist(jsonEncode(toJson()));
+    _needsFlush = true;
+    _backupDirty = true;
+    _saveTimer?.cancel();
+    _saveTimer = Timer(const Duration(milliseconds: 500), flush);
     notifyListeners();
     _scheduleStats();
   }
 
-  String exportJson() => const JsonEncoder.withIndent('  ').convert(toJson());
+  void flush() {
+    _saveTimer?.cancel();
+    if (!_needsFlush) return;
+    _needsFlush = false;
+    _persist(jsonEncode(toJson()));
+  }
 
-  bool importJson(String s) {
+  Future<String?> _embed(String? p) async {
+    if (p == null || p.isEmpty) return null;
+    if (p.startsWith('http')) return p;
+    return await fileToDataUrl(p);
+  }
+
+  Future<String?> _local(String? v) async => (v != null && v.startsWith('data:')) ? await saveDataUrl(v) : v;
+
+  /// نسخة كاملة تتضمن الصور (تُحوَّل من ملفات إلى نصوص)
+  Future<String> exportJsonFull({bool compact = false, bool images = true}) async {
+    final m = toJson();
+    final st = Map<String, dynamic>.from(m['settings'] as Map);
+    st['logoPath'] = images ? await _embed(settings.logoPath) : null;
+    st['ownerImage'] = images ? await _embed(settings.ownerImage) : null;
+    m['settings'] = st;
+    final ps = <Map<String, dynamic>>[];
+    for (final p in products) {
+      final j = p.toJson();
+      j['imagePath'] = images ? await _embed(p.imagePath) : null;
+      ps.add(j);
+    }
+    m['products'] = ps;
+    final prs = <Map<String, dynamic>>[];
+    for (final pr in purchases) {
+      final j = pr.toJson();
+      j['receipt'] = images ? await _embed(pr.receipt) : null;
+      prs.add(j);
+    }
+    m['purchases'] = prs;
+    return compact ? jsonEncode(m) : const JsonEncoder.withIndent('  ').convert(m);
+  }
+
+  Future<void> _localizeImages() async {
+    settings.logoPath = await _local(settings.logoPath);
+    settings.ownerImage = await _local(settings.ownerImage);
+    for (final p in products) {
+      p.imagePath = await _local(p.imagePath);
+    }
+    for (final pr in purchases) {
+      pr.receipt = await _local(pr.receipt);
+    }
+  }
+
+  /// ترحيل الصور القديمة المخزنة داخل الملف الرئيسي إلى ملفات مستقلة (مرة واحدة)
+  Future<void> migrateImages() async {
+    final has = (settings.logoPath ?? '').startsWith('data:') ||
+        (settings.ownerImage ?? '').startsWith('data:') ||
+        products.any((p) => (p.imagePath ?? '').startsWith('data:')) ||
+        purchases.any((p) => (p.receipt ?? '').startsWith('data:'));
+    if (!has) return;
+    await _localizeImages();
+    _save();
+    flush();
+  }
+
+  Future<bool> importJson(String text) async {
     try {
-      final j = jsonDecode(s) as Map<String, dynamic>;
+      final j = jsonDecode(text) as Map<String, dynamic>;
       if (!j.containsKey('products') || !j.containsKey('customers') || !j.containsKey('captains') || !j.containsKey('orders')) {
         return false;
       }
       _load(j);
+      await _localizeImages();
       _save();
+      flush();
       return true;
     } catch (_) {
       return false;
     }
+  }
+
+  // ---- نسخ احتياطي سحابي ----
+  Future<bool> backupNow() async {
+    if (!cloud.isOwner) return false;
+    var data = await exportJsonFull(compact: true);
+    if (data.length > 9000000) data = await exportJsonFull(compact: true, images: false);
+    final ok = await cloud.putBackup(data);
+    if (ok) {
+      lastBackupAt = DateTime.now();
+      _backupDirty = false;
+      notifyListeners();
+    }
+    return ok;
+  }
+
+  Future<String?> restoreFromCloud() async {
+    final b = await cloud.getBackup();
+    if (b == null) return 'تعذّر الاتصال بالسحابة';
+    final data = b['data'];
+    if (data is! String || data.isEmpty) return 'لا توجد نسخة احتياطية في السحابة';
+    return await importJson(data) ? null : 'النسخة الاحتياطية غير صالحة';
   }
 
   void resetAll() {
@@ -1403,7 +1989,7 @@ class AppStore extends ChangeNotifier {
 
   // ---- Auth ----
   bool login(String u, String p) {
-    if (u.trim() == settings.username && p == settings.password) {
+    if (u.trim() == settings.username && settings.checkPassword(p)) {
       loggedIn = true;
       notifyListeners();
       return true;
@@ -1418,7 +2004,10 @@ class AppStore extends ChangeNotifier {
 
   void updateCredentials(String u, String p) {
     settings.username = u;
-    settings.password = p;
+    if (p.isNotEmpty) {
+      settings.setPassword(p);
+      settings.mustChange = false;
+    }
     _save();
   }
 
@@ -1475,7 +2064,9 @@ class AppStore extends ChangeNotifier {
       next -= amount;
     }
     if (next < 0) return 'لا يمكن أن يصبح المخزون بالسالب';
+    final delta = next - p.stock;
     p.stock = next;
+    if (delta != 0) _logMove(p, delta, action == 'set' ? 'count' : 'manual', action == 'set' ? 'جرد/تحديد الكمية' : (delta > 0 ? 'إضافة توريد' : 'خصم يدوي'));
     _save();
     return null;
   }
@@ -1685,12 +2276,20 @@ class AppStore extends ChangeNotifier {
     _poll?.cancel();
     if (!cloud.isOwner) return;
     _poll = Timer.periodic(const Duration(seconds: 8), (_) => pollCloud());
+    _backupTimer?.cancel();
+    _backupTimer = Timer.periodic(const Duration(minutes: 20), (_) {
+      if (_backupDirty) backupNow();
+    });
+    Future.delayed(const Duration(seconds: 40), () {
+      if (cloud.isOwner) backupNow();
+    });
     fullSync();
   }
 
   void stopCloud() {
     _poll?.cancel();
     _poll = null;
+    _backupTimer?.cancel();
   }
 
   Future<void> pollCloud() async {
@@ -1722,17 +2321,56 @@ class AppStore extends ChangeNotifier {
     }
   }
 
+  // ---- المخزون ----
+  void _logMove(Product p, double delta, String type, String note) {
+    stockMoves.add(StockMove(
+        id: DateTime.now().microsecondsSinceEpoch + stockMoves.length,
+        productId: p.id,
+        delta: delta,
+        balance: p.stock,
+        type: type,
+        note: note,
+        date: DateTime.now()));
+    if (stockMoves.length > 3000) stockMoves.removeRange(0, 500);
+  }
+
+  /// يغيّر مخزون صنف (إن كان يُتتبَّع) ويسجّل الحركة
+  void _stock(int productId, double delta, String type, String note) {
+    final p = product(productId);
+    if (p == null || !p.track || delta == 0) return;
+    p.stock = max(0, p.stock + delta);
+    _logMove(p, delta, type, note);
+  }
+
+  // ---- الدَّين (الآجل) ----
+  double customerDebt(int cid) {
+    var d = 0.0;
+    for (final o in orders) {
+      if (o.customerId == cid && o.status != 'cancel') d += o.debt;
+    }
+    for (final x in customerPayments) {
+      if (x.customerId == cid) d -= x.amount;
+    }
+    return d;
+  }
+
+  String? addCustomerPayment(int cid, double amount, String note) {
+    if (amount <= 0) return 'أدخل مبلغاً صحيحاً';
+    if (amount > customerDebt(cid) + 0.000001) return 'المبلغ أكبر من الدَّين المستحق';
+    customerPayments.add(CustomerPayment(id: DateTime.now().millisecondsSinceEpoch, customerId: cid, amount: amount, note: note, date: DateTime.now()));
+    _save();
+    return null;
+  }
+
+  void saveClose(DayClose c) {
+    closes.removeWhere((x) => x.day == c.day);
+    closes.add(c);
+    _save();
+  }
+
   // ---- Orders ----
-  Order createOrder({
-    required int customerId,
-    required int captainId,
-    required List<OrderItem> items,
-    required double delivery,
-    required double discount,
-    required String notes,
-    required String method,
-    required double paidNow,
-  }) {
+  /// حساب مبالغ الطلب حسب طريقة الدفع
+  ({double sub, double disc, double goods, double paid, double due}) _calc(List<OrderItem> items, double discount, String method, double paidNow) {
     final sub = items.fold<double>(0, (a, i) => a + i.lineTotal);
     final disc = discount.clamp(0, sub).toDouble();
     final goods = max(0.0, sub - disc);
@@ -1743,27 +2381,44 @@ class AppStore extends ChangeNotifier {
     } else if (method == 'partial') {
       paid = paidNow.clamp(0, goods).toDouble();
       due = goods - paid;
+    } else if (method == 'credit') {
+      paid = 0;
+      due = 0;
     }
+    return (sub: sub, disc: disc, goods: goods, paid: paid, due: due);
+  }
+
+  Order createOrder({
+    required int customerId,
+    required int captainId,
+    required List<OrderItem> items,
+    required double delivery,
+    required double discount,
+    required String notes,
+    required String method,
+    required double paidNow,
+  }) {
+    final c = _calc(items, discount, method, paidNow);
+    final free = method == 'prepaid' || method == 'credit';
     final o = Order(
       id: _nO++,
       date: DateTime.now(),
       customerId: customerId,
       captainId: captainId,
       items: items,
-      subtotal: sub,
+      subtotal: c.sub,
       delivery: delivery,
-      discount: disc,
-      total: goods + delivery,
-      goodsTotal: goods,
-      paidNow: paid,
-      goodsDue: due,
-      captainCredit: method == 'prepaid' ? delivery : 0,
+      discount: c.disc,
+      total: c.goods + delivery,
+      goodsTotal: c.goods,
+      paidNow: c.paid,
+      goodsDue: c.due,
+      captainCredit: free ? delivery : 0,
       notes: notes,
       method: method,
     );
     for (final i in items) {
-      final p = product(i.productId);
-      if (p != null) p.stock = max(0, p.stock - i.qty);
+      _stock(i.productId, -i.qty, 'sale', 'طلب #${o.id}');
     }
     orders.add(o);
     _save();
@@ -1771,23 +2426,79 @@ class AppStore extends ChangeNotifier {
     return o;
   }
 
+  /// تعديل طلب محفوظ (الأصناف، العميل، الكابتن، الدفع...)
+  String? updateOrder(
+    Order o, {
+    required int customerId,
+    required int captainId,
+    required List<OrderItem> items,
+    required double delivery,
+    required double discount,
+    required String notes,
+    required String method,
+    required double paidNow,
+  }) {
+    final oldCaptain = o.captainId;
+    final live = o.status != 'cancel';
+    if (live) {
+      for (final i in items) {
+        final p = product(i.productId);
+        if (p == null || !p.track) continue;
+        final back = o.items.where((x) => x.productId == i.productId).fold<double>(0, (a, x) => a + x.qty);
+        final need = items.where((x) => x.productId == i.productId).fold<double>(0, (a, x) => a + x.qty);
+        if (need > p.stock + back + 0.000001) return 'الكمية المطلوبة من ${p.name} أكبر من المخزون المتاح';
+      }
+      for (final i in o.items) {
+        _stock(i.productId, i.qty, 'return', 'تعديل طلب #${o.id}');
+      }
+    }
+    final c = _calc(items, discount, method, paidNow);
+    final free = method == 'prepaid' || method == 'credit';
+    o
+      ..customerId = customerId
+      ..captainId = captainId
+      ..items = items
+      ..subtotal = c.sub
+      ..discount = c.disc
+      ..delivery = delivery
+      ..total = c.goods + delivery
+      ..goodsTotal = c.goods
+      ..paidNow = c.paid
+      ..goodsDue = c.due
+      ..captainCredit = free ? delivery : 0
+      ..notes = notes
+      ..method = method;
+    if (live) {
+      for (final i in items) {
+        _stock(i.productId, -i.qty, 'sale', 'تعديل طلب #${o.id}');
+      }
+    }
+    _save();
+    if (cloud.isOwner) {
+      if (oldCaptain != captainId) cloud.deleteOrder(oldCaptain, o.id);
+      _syncOrder(o);
+    }
+    return null;
+  }
+
   String? changeStatus(Order o, String s) {
     if (o.status == s) return null;
     if (s == 'cancel') {
       for (final i in o.items) {
-        final p = product(i.productId);
-        if (p != null) p.stock += i.qty;
+        _stock(i.productId, i.qty, 'return', 'إلغاء طلب #${o.id}');
       }
     } else if (o.status == 'cancel') {
       for (final i in o.items) {
         final p = product(i.productId);
-        if (p == null || i.qty > p.stock) return 'لا يمكن إعادة الطلب: المخزون غير كافٍ';
+        if (p != null && p.track && i.qty > p.stock) return 'لا يمكن إعادة الطلب: المخزون غير كافٍ';
       }
       for (final i in o.items) {
-        product(i.productId)!.stock -= i.qty;
+        _stock(i.productId, -i.qty, 'sale', 'إعادة طلب #${o.id}');
       }
     }
     o.status = s;
+    if (s == 'delivery') o.startAt ??= DateTime.now();
+    if (s == 'done') o.doneAt = DateTime.now();
     _save();
     _syncOrder(o);
     return null;
@@ -1798,8 +2509,7 @@ class AppStore extends ChangeNotifier {
     if (o == null) return;
     if (o.status != 'cancel') {
       for (final i in o.items) {
-        final p = product(i.productId);
-        if (p != null) p.stock += i.qty;
+        _stock(i.productId, i.qty, 'return', 'حذف طلب #${o.id}');
       }
     }
     if (cloud.isOwner) cloud.deleteOrder(o.captainId, id);
@@ -1821,12 +2531,16 @@ String invoiceText(AppStore s, Order o) {
   final full = o.method == 'prepaid';
   final pay = full
       ? 'تم الدفع بالكامل (الأصناف + التوصيل) ✅'
-      : o.method == 'partial'
-          ? 'مدفوع جزئياً'
-          : 'الدفع عند الاستلام';
-  final dueLine = o.customerDue <= 0
-      ? 'المطلوب عند الاستلام: لا يوجد — طلبك مدفوع بالكامل ✅\n'
-      : 'المطلوب عند الاستلام (شامل التوصيل): ${money(o.customerDue)}\n';
+      : o.method == 'credit'
+          ? 'آجل — يُقيَّد على حسابكم'
+          : o.method == 'partial'
+              ? 'مدفوع جزئياً'
+              : 'الدفع عند الاستلام';
+  final dueLine = o.method == 'credit'
+      ? 'المطلوب عند الاستلام: لا يوجد — الطلب آجل على حسابكم (${money(o.total)})\n'
+      : o.customerDue <= 0
+          ? 'المطلوب عند الاستلام: لا يوجد — طلبك مدفوع بالكامل ✅\n'
+          : 'المطلوب عند الاستلام (شامل التوصيل): ${money(o.customerDue)}\n';
   return 'مرحباً ${c?.name ?? ''} 🌿\n'
       'فاتورة طلبك من ${s.settings.storeName} رقم #${o.id}\n'
       '──────────────\n'
@@ -1847,8 +2561,8 @@ String invoiceText(AppStore s, Order o) {
 
 String captainText(AppStore s, Order o) {
   final c = s.customer(o.customerId);
-  final collect = o.method == 'prepaid'
-      ? '✅ الطلب مدفوع بالكامل (الأصناف + التوصيل)\n'
+  final collect = o.method == 'prepaid' || o.method == 'credit'
+      ? (o.method == 'credit' ? '📒 الطلب آجل على حساب العميل\n' : '✅ الطلب مدفوع بالكامل (الأصناف + التوصيل)\n') +
           'لا تحصّل أي مبلغ من العميل.\n'
           'أجرة توصيلك: ${money(o.delivery)} (تُقيَّد لك على المحل)\n'
       : 'المطلوب تحصيله من العميل: ${money(o.customerDue)}\n'
@@ -1899,7 +2613,7 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final u = TextEditingController(text: 'admin');
+  final u = TextEditingController();
   final p = TextEditingController();
   final cu = TextEditingController();
   final cp = TextEditingController();
@@ -1956,9 +2670,6 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                     const SizedBox(height: 18),
                     LuxButton('تسجيل الدخول', Icons.login_rounded, () => _go(s)),
-                    const SizedBox(height: 12),
-                    const Text('بيانات البداية: admin / 1234 — يمكن تغييرها من الإعدادات.',
-                        textAlign: TextAlign.center, style: TextStyle(fontSize: 11, color: Color(0xFF9AA59F))),
                   ] else ...[
                     TextField(
                       controller: cu,
@@ -2022,7 +2733,7 @@ class DashboardPage extends StatelessWidget {
     final sales = today.fold<double>(0, (a, o) => a + o.total);
     final pending = s.orders.where((o) => o.status == 'new' || o.status == 'prep' || o.status == 'delivery').length;
     final recent = [...s.orders]..sort((a, b) => b.date.compareTo(a.date));
-    final low = s.products.where((p) => p.active && p.stock <= p.lowStock).toList();
+    final low = s.products.where((p) => p.active && p.track && p.stock <= p.lowStock).toList();
     final w = MediaQuery.of(context).size.width;
 
     Widget hero(String t, String v) => Expanded(
@@ -2227,6 +2938,7 @@ class _OrdersPageState extends State<OrdersPage> {
         const Divider(height: 18),
         Wrap(children: [
           _act(Icons.receipt_long_rounded, 'فاتورة', C.g, () => Navigator.push(context, MaterialPageRoute(builder: (_) => InvoicePage(orderId: o.id)))),
+          _act(Icons.edit_rounded, 'تعديل', C.blue, () => Navigator.push(context, MaterialPageRoute(builder: (_) => OrderFormPage(edit: o)))),
           _act(Icons.send_rounded, 'للعميل', C.wa, () => sendWa(context, c?.phone ?? '', invoiceText(s, o))),
           _act(Icons.two_wheeler_rounded, 'للكابتن', const Color(0xFFB68B24), () => sendWa(context, cap?.phone ?? '', captainText(s, o))),
           _act(Icons.delete_outline_rounded, 'حذف', C.red, () async {
@@ -2259,11 +2971,13 @@ class _OrdersPageState extends State<OrdersPage> {
 class _Line {
   final Product p;
   double qty;
-  _Line(this.p, this.qty);
+  double price;
+  _Line(this.p, this.qty, [double? price]) : price = price ?? p.price;
 }
 
 class OrderFormPage extends StatefulWidget {
-  const OrderFormPage({super.key});
+  final Order? edit;
+  const OrderFormPage({super.key, this.edit});
   @override
   State<OrderFormPage> createState() => _OrderFormPageState();
 }
@@ -2278,8 +2992,33 @@ class _OrderFormPageState extends State<OrderFormPage> {
   String discType = 'fixed';
   String method = 'prepaid';
   String pq = '';
+  final Map<int, double> _reserved = {};
 
-  double get sub => cart.fold(0, (a, l) => a + l.p.price * l.qty * unitFactor(l.p.unit));
+  @override
+  void initState() {
+    super.initState();
+    final e = widget.edit;
+    if (e == null) return;
+    final st = context.read<AppStore>();
+    customerId = e.customerId;
+    captainId = e.captainId;
+    for (final i in e.items) {
+      final pr = st.product(i.productId) ?? Product(id: i.productId, name: i.name, price: i.price, unit: i.unit, track: false);
+      cart.add(_Line(pr, i.qty, i.price));
+      if (e.status != 'cancel') _reserved[i.productId] = (_reserved[i.productId] ?? 0) + i.qty;
+    }
+    String t(double v) => qtyText(v).replaceAll(',', '');
+    delivery.text = t(e.delivery);
+    discount.text = t(e.discount);
+    notes.text = e.notes;
+    paid.text = t(e.paidNow);
+    method = e.method;
+  }
+
+  /// الكمية المتاحة للبيع (مع إضافة ما حجزه الطلب نفسه عند التعديل)
+  double _avail(Product p) => p.track ? p.stock + (_reserved[p.id] ?? 0) : double.infinity;
+
+  double get sub => cart.fold(0, (a, l) => a + l.price * l.qty * unitFactor(l.p.unit));
   double get del => num2(delivery.text).clamp(0, double.infinity).toDouble();
   double get disc {
     final v = num2(discount.text).clamp(0, double.infinity).toDouble();
@@ -2295,9 +3034,9 @@ class _OrderFormPageState extends State<OrderFormPage> {
       final i = cart.indexWhere((l) => l.p.id == p.id);
       final step = p.isPiece ? 1.0 : 100.0;
       if (i >= 0) {
-        cart[i].qty = (cart[i].qty + step).clamp(0, p.stock).toDouble();
+        cart[i].qty = (cart[i].qty + step).clamp(0, _avail(p)).toDouble();
       } else {
-        cart.add(_Line(p, step.clamp(0, p.stock).toDouble()));
+        cart.add(_Line(p, step.clamp(0, _avail(p)).toDouble()));
       }
     });
   }
@@ -2311,11 +3050,12 @@ class _OrderFormPageState extends State<OrderFormPage> {
     final note = switch (method) {
       'cod' => 'المطلوب من العميل عند التسليم: ${money(goods + del)} (الأصناف ${money(goods)} + التوصيل ${money(del)})',
       'partial' => 'المدفوع الآن: ${money(paidV)} — المتبقي عند التسليم شامل التوصيل: ${money(goods - paidV + del)}',
+      'credit' => 'آجل: يُقيَّد ${money(goods + del)} دَيناً على العميل، ولا يحصّل الكابتن شيئاً، وتُقيَّد أجرة التوصيل ${money(del)} للكابتن على المحل',
       _ => 'الطلب مدفوع بالكامل شامل التوصيل (${money(goods + del)}). لا يُحصَّل شيء من العميل، وتُقيَّد أجرة التوصيل ${money(del)} للكابتن على المحل',
     };
 
     return Scaffold(
-      appBar: AppBar(title: const Text('إنشاء طلب جديد'), flexibleSpace: Container(decoration: const BoxDecoration(gradient: C.brandGradient))),
+      appBar: AppBar(title: Text(widget.edit == null ? 'إنشاء طلب جديد' : 'تعديل الطلب #${widget.edit!.id}'), flexibleSpace: Container(decoration: const BoxDecoration(gradient: C.brandGradient))),
       body: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 900),
@@ -2349,7 +3089,7 @@ class _OrderFormPageState extends State<OrderFormPage> {
                       isExpanded: true,
                       decoration: const InputDecoration(labelText: 'الكابتن', prefixIcon: Icon(Icons.two_wheeler_rounded)),
                       items: [
-                        for (final c in s.captains.where((c) => c.available)) DropdownMenuItem(value: c.id, child: Text('${c.name} — ${c.phone}', overflow: TextOverflow.ellipsis))
+                        for (final c in s.captains.where((c) => c.available || c.id == captainId)) DropdownMenuItem(value: c.id, child: Text('${c.name} — ${c.phone}', overflow: TextOverflow.ellipsis))
                       ],
                       onChanged: (v) => setState(() => captainId = v),
                     ),
@@ -2392,9 +3132,9 @@ class _OrderFormPageState extends State<OrderFormPage> {
                     flex: 3,
                     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                       Text(l.p.name, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 13)),
-                      Text('${money(l.p.price)} / ${unitName(l.p.unit)}', style: const TextStyle(color: C.muted, fontSize: 10)),
+                      Text('${money(l.price)} / ${unitName(l.p.unit)}', style: const TextStyle(color: C.muted, fontSize: 10)),
                       const SizedBox(height: 2),
-                      Text(money(l.p.price * l.qty * unitFactor(l.p.unit)), style: const TextStyle(color: C.g2, fontWeight: FontWeight.w900)),
+                      Text(money(l.price * l.qty * unitFactor(l.p.unit)), style: const TextStyle(color: C.g2, fontWeight: FontWeight.w900)),
                     ]),
                   ),
                   IconButton(
@@ -2417,7 +3157,7 @@ class _OrderFormPageState extends State<OrderFormPage> {
                       onFieldSubmitted: (v) => setState(() {
                         var q = num2(v);
                         if (l.p.isPiece) q = q.floorToDouble();
-                        l.qty = q.clamp(0, l.p.stock).toDouble();
+                        l.qty = q.clamp(0, _avail(l.p)).toDouble();
                         if (l.qty <= 0) cart.remove(l);
                       }),
                     ),
@@ -2456,7 +3196,7 @@ class _OrderFormPageState extends State<OrderFormPage> {
                 DropdownButtonFormField<String>(
                   value: method,
                   isExpanded: true,
-                  items: [for (final m in ['prepaid', 'cod', 'partial']) DropdownMenuItem(value: m, child: Text(paymentLabel(m)))],
+                  items: [for (final m in ['prepaid', 'cod', 'partial', 'credit']) DropdownMenuItem(value: m, child: Text(paymentLabel(m)))],
                   onChanged: (v) => setState(() => method = v!),
                 ),
                 if (method == 'partial') ...[
@@ -2498,7 +3238,7 @@ class _OrderFormPageState extends State<OrderFormPage> {
 
   Widget _tile(Product p) {
     final inCart = cart.where((l) => l.p.id == p.id).fold<double>(0, (a, l) => a + l.qty);
-    final out = p.stock <= 0;
+    final out = _avail(p) <= 0;
     return GestureDetector(
       onTap: out ? null : () => add(p),
       child: Container(
@@ -2558,13 +3298,30 @@ class _OrderFormPageState extends State<OrderFormPage> {
     if (customerId == null || captainId == null) return toast(context, 'اختر العميل والكابتن');
     for (final l in cart) {
       if (l.qty <= 0) return toast(context, 'أدخل كمية صحيحة للصنف ${l.p.name}');
-      if (l.qty > l.p.stock) return toast(context, 'الكمية المطلوبة من ${l.p.name} أكبر من المخزون (${qtyText(l.p.stock)})');
+      if (l.qty > _avail(l.p)) return toast(context, 'الكمية المطلوبة من ${l.p.name} أكبر من المخزون (${qtyText(_avail(l.p))})');
       if (l.p.isPiece && l.qty != l.qty.roundToDouble()) return toast(context, 'صنف ${l.p.name} يُباع بالقطعة، أدخل رقماً صحيحاً');
+    }
+    final items = [for (final l in cart) OrderItem(productId: l.p.id, name: l.p.name, price: l.price, cost: l.p.cost, unit: l.p.unit, qty: l.qty)];
+    final e = widget.edit;
+    if (e != null) {
+      final err = s.updateOrder(e,
+          customerId: customerId!,
+          captainId: captainId!,
+          items: items,
+          delivery: del,
+          discount: disc,
+          notes: notes.text.trim(),
+          method: method,
+          paidNow: num2(paid.text));
+      if (err != null) return toast(context, err);
+      Navigator.pop(context);
+      toast(context, 'تم تعديل الطلب ✓');
+      return;
     }
     final o = s.createOrder(
       customerId: customerId!,
       captainId: captainId!,
-      items: [for (final l in cart) OrderItem(productId: l.p.id, name: l.p.name, price: l.p.price, unit: l.p.unit, qty: l.qty)],
+      items: items,
       delivery: del,
       discount: disc,
       notes: notes.text.trim(),
@@ -2589,16 +3346,37 @@ class InvoicePage extends StatefulWidget {
 class _InvoicePageState extends State<InvoicePage> {
   final boundary = GlobalKey();
 
+  Future<Uint8List> _capture() async {
+    final b = boundary.currentContext!.findRenderObject() as RenderRepaintBoundary;
+    final img = await b.toImage(pixelRatio: 3);
+    final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+    if (bd == null) throw Exception('no data');
+    return bd.buffer.asUint8List();
+  }
+
   /// يلتقط الفاتورة كصورة ويفتح قائمة المشاركة (واتساب وغيره)
   Future<void> _shareImage(int id, String caption) async {
     try {
-      final b = boundary.currentContext!.findRenderObject() as RenderRepaintBoundary;
-      final img = await b.toImage(pixelRatio: 3);
-      final bd = await img.toByteData(format: ui.ImageByteFormat.png);
-      if (bd == null) throw Exception('no data');
-      await shareBytesFile(bd.buffer.asUint8List(), 'invoice-$id.png', 'image/png', text: caption);
+      await shareBytesFile(await _capture(), 'invoice-$id.png', 'image/png', text: caption);
     } catch (_) {
       if (mounted) toast(context, 'تعذّر إنشاء صورة الفاتورة');
+    }
+  }
+
+  /// فاتورة PDF (الصورة داخل صفحة A4) للمشاركة أو الطباعة
+  Future<void> _sharePdf(int id) async {
+    try {
+      final png = await _capture();
+      final doc = pw.Document();
+      final image = pw.MemoryImage(png);
+      doc.addPage(pw.Page(
+        pageFormat: PdfPageFormat.a4,
+        margin: const pw.EdgeInsets.all(24),
+        build: (_) => pw.Center(child: pw.Image(image, fit: pw.BoxFit.contain)),
+      ));
+      await shareBytesFile(Uint8List.fromList(await doc.save()), 'invoice-$id.pdf', 'application/pdf');
+    } catch (_) {
+      if (mounted) toast(context, 'تعذّر إنشاء ملف PDF');
     }
   }
 
@@ -2631,6 +3409,12 @@ class _InvoicePageState extends State<InvoicePage> {
               child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
                 const PageHead('إرسال الفاتورة'),
                 LuxButton('مشاركة الفاتورة كصورة', Icons.image_rounded, () => _shareImage(o.id, 'فاتورة #${o.id} — ${s.settings.storeName}'), colors: const [C.g, C.g2]),
+                const SizedBox(height: 8),
+                Row(children: [
+                  Expanded(child: OutlinedButton.icon(onPressed: () => _sharePdf(o.id), icon: const Icon(Icons.picture_as_pdf_rounded, color: C.red), label: const Text('PDF / طباعة'))),
+                  const SizedBox(width: 8),
+                  Expanded(child: OutlinedButton.icon(onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => OrderFormPage(edit: o))), icon: const Icon(Icons.edit_rounded), label: const Text('تعديل الطلب'))),
+                ]),
                 const SizedBox(height: 10),
                 Row(children: [
                   Expanded(child: LuxButton('رسالة للعميل', Icons.send_rounded, () => sendWa(context, c?.phone ?? '', invoiceText(s, o)), colors: const [Color(0xFF128C4A), C.wa])),
@@ -2719,7 +3503,7 @@ class InvoiceCard extends StatelessWidget {
             child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
               const Text('تفاصيل السداد', style: TextStyle(fontWeight: FontWeight.w900, color: C.g, fontSize: 13)),
               const SizedBox(height: 4),
-              sumRow('حالة الدفع', o.method == 'prepaid' ? 'تم الدفع بالكامل' : o.method == 'partial' ? 'مدفوع جزئياً' : 'الدفع عند الاستلام'),
+              sumRow('حالة الدفع', o.method == 'prepaid' ? 'تم الدفع بالكامل' : o.method == 'credit' ? 'آجل (دَين على العميل)' : o.method == 'partial' ? 'مدفوع جزئياً' : 'الدفع عند الاستلام'),
               sumRow('المبلغ المدفوع', money(o.paidAmount)),
               sumRow('المطلوب عند الاستلام', money(due)),
             ]),
@@ -2883,10 +3667,10 @@ class InvoiceCard extends StatelessWidget {
                 gradient: const LinearGradient(colors: [Color(0xFFF4F9EF), Colors.white, Color(0xFFF9F6E9)]),
                 borderColor: const Color(0xFFD9E5C7),
                 child: Column(children: [
-                  Text(due == 0 ? 'الطلب مدفوع بالكامل — لا يوجد مبلغ مطلوب' : 'المبلغ المتبقي عند الاستلام', style: const TextStyle(fontWeight: FontWeight.w900, color: C.g, fontSize: 13)),
+                  Text(due == 0 ? (o.method == 'credit' ? 'طلب آجل — يُقيَّد على حساب العميل' : 'الطلب مدفوع بالكامل — لا يوجد مبلغ مطلوب') : 'المبلغ المتبقي عند الاستلام', style: const TextStyle(fontWeight: FontWeight.w900, color: C.g, fontSize: 13)),
                   const SizedBox(height: 4),
                   FittedBox(fit: BoxFit.scaleDown, child: Text(money(due), style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w900, color: Color(0xFF174B38)))),
-                  Text(due == 0 ? 'شامل قيمة الأصناف ورسوم التوصيل' : 'يشمل المبلغ المتبقي رسوم التوصيل',
+                  Text(due == 0 ? (o.method == 'credit' ? 'لا يحصّل الكابتن أي مبلغ' : 'شامل قيمة الأصناف ورسوم التوصيل') : 'يشمل المبلغ المتبقي رسوم التوصيل',
                       textAlign: TextAlign.center, style: const TextStyle(fontSize: 10, color: C.muted)),
                 ]),
               ),
@@ -2947,6 +3731,12 @@ class _ProductsPageState extends State<ProductsPage> {
           icon: const Icon(Icons.add),
           label: const Text('صنف'),
         ),
+        const SizedBox(width: 6),
+        IconButton.filledTonal(
+          tooltip: 'جرد المخزون',
+          onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const StocktakePage())),
+          icon: const Icon(Icons.fact_check_rounded),
+        ),
       ]),
       const SizedBox(height: 14),
       if (list.isEmpty) const Empty('لا توجد أصناف', icon: Icons.restaurant_menu),
@@ -2961,7 +3751,7 @@ class _ProductsPageState extends State<ProductsPage> {
   }
 
   Widget _card(BuildContext context, Product p) {
-    final low = p.stock <= p.lowStock;
+    final low = p.track && p.stock <= p.lowStock;
     return Container(
       clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
@@ -2990,13 +3780,14 @@ class _ProductsPageState extends State<ProductsPage> {
             const SizedBox(height: 4),
             Text('${money(p.price)} / ${unitShort(p.unit).isEmpty ? 'وحدة' : unitShort(p.unit)}', style: const TextStyle(color: C.g2, fontWeight: FontWeight.w900, fontSize: 12)),
             const SizedBox(height: 6),
-            Badge2('المخزون: ${qtyText(p.stock)}', low ? C.orange : C.g2),
+            Badge2(p.track ? 'المخزون: ${qtyText(p.stock)}' : 'بدون تتبّع', p.track ? (low ? C.orange : C.g2) : C.muted),
           ]),
         ),
         const Spacer(),
         const Divider(height: 1),
         Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
           IconButton(tooltip: 'المخزون', visualDensity: VisualDensity.compact, onPressed: () => _adjust(context, p), icon: const Icon(Icons.inventory_2_outlined, size: 20, color: C.g)),
+          IconButton(tooltip: 'سجل الحركة', visualDensity: VisualDensity.compact, onPressed: () => showSheet(context, (_) => StockLogSheet(product: p)), icon: const Icon(Icons.history_rounded, size: 20, color: C.purple)),
           IconButton(tooltip: 'تعديل', visualDensity: VisualDensity.compact, onPressed: () => showSheet(context, (_) => _ProductForm(product: p)), icon: const Icon(Icons.edit_outlined, size: 20, color: C.blue)),
           IconButton(
             tooltip: 'حذف',
@@ -3076,6 +3867,7 @@ class _ProductFormState extends State<_ProductForm> {
   late final low = TextEditingController(text: widget.product == null ? '10' : '${widget.product!.lowStock}');
   late String unit = widget.product?.unit ?? 'piece';
   late bool active = widget.product?.active ?? true;
+  late bool track = widget.product?.track ?? true;
   String? image;
 
   @override
@@ -3123,6 +3915,14 @@ class _ProductFormState extends State<_ProductForm> {
           value: active,
           onChanged: (v) => setState(() => active = v),
         ),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          activeColor: C.g2,
+          title: const Text('تتبّع المخزون', style: TextStyle(fontWeight: FontWeight.w800)),
+          subtitle: const Text('أوقفه للأصناف التي لا تُجرد (مثل المشروبات المحضّرة)', style: TextStyle(fontSize: 11)),
+          value: track,
+          onChanged: (v) => setState(() => track = v),
+        ),
         const SizedBox(height: 6),
         LuxButton('حفظ', Icons.save_rounded, () {
           if (!form.currentState!.validate()) return;
@@ -3134,6 +3934,7 @@ class _ProductFormState extends State<_ProductForm> {
           p.stock = num2(stock.text);
           p.lowStock = num2(low.text);
           p.active = active;
+          p.track = track;
           p.imagePath = image;
           st.saveProduct(p);
           Navigator.pop(context);
@@ -3201,6 +4002,7 @@ class _CustomersPageState extends State<CustomersPage> {
             ]),
           ),
           Badge2('$count طلب', C.g2),
+          if (s.customerDebt(c.id) > 0) ...[const SizedBox(width: 6), Badge2('عليه ${money(s.customerDebt(c.id))}', C.red)],
         ]),
         const SizedBox(height: 8),
         Row(children: [
@@ -3215,6 +4017,11 @@ class _CustomersPageState extends State<CustomersPage> {
           ),
         const Divider(height: 18),
         Wrap(children: [
+          TextButton.icon(
+            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CustomerPage(customerId: c.id))),
+            icon: const Icon(Icons.history_rounded, size: 18),
+            label: const Text('السجل والحساب'),
+          ),
           TextButton.icon(
             onPressed: () => sendWa(context, c.phone, 'مرحباً ${c.name} 🌿 من ${s.settings.storeName}'),
             icon: const Icon(Icons.chat_rounded, size: 18, color: C.wa),
@@ -3277,6 +4084,10 @@ class _CustomerFormState extends State<_CustomerForm> {
         inp('ملاحظات', notes, lines: 2),
         LuxButton('حفظ', Icons.save_rounded, () {
           if (!form.currentState!.validate()) return;
+          final wn = waNumber(phone.text);
+          if (wn.isEmpty) return toast(context, 'رقم الهاتف غير صالح');
+          final dup = context.read<AppStore>().customers.where((x) => x.id != (widget.customer?.id ?? 0) && waNumber(x.phone) == wn).toList();
+          if (dup.isNotEmpty) return toast(context, 'الرقم مسجّل لعميل آخر: ${dup.first.name}');
           final c = widget.customer ?? Customer(id: 0, name: '', phone: '', address: '');
           c.name = name.text.trim();
           c.phone = phone.text.trim();
@@ -3822,107 +4633,6 @@ class _CaptainFormState extends State<_CaptainForm> {
 }
 
 // ====================================================================
-//  التقارير
-// ====================================================================
-
-class ReportsPage extends StatefulWidget {
-  const ReportsPage({super.key});
-  @override
-  State<ReportsPage> createState() => _ReportsPageState();
-}
-
-class _ReportsPageState extends State<ReportsPage> {
-  DateTime? day = DateTime.now(); // null = all
-
-  @override
-  Widget build(BuildContext context) {
-    final s = context.watch<AppStore>();
-    final list = s.orders.where((o) => day == null || dayKey(o.date) == dayKey(day!)).toList();
-    final valid = list.where((o) => o.status != 'cancel').toList();
-    final sales = valid.fold<double>(0, (a, o) => a + o.total);
-    final delivery = valid.fold<double>(0, (a, o) => a + o.delivery);
-    final goods = valid.fold<double>(0, (a, o) => a + o.goodsTotal);
-    final unfinished = valid.where((o) => o.status != 'done').length;
-    final cash = s.captains.fold<double>(0, (a, c) => a + s.balances(c.id).cashDue);
-
-    final top = <String, double>{};
-    final topQty = <String, double>{};
-    for (final o in valid) {
-      for (final i in o.items) {
-        top[i.name] = (top[i.name] ?? 0) + i.lineTotal;
-        topQty[i.name] = (topQty[i.name] ?? 0) + i.qty;
-      }
-    }
-    final ranked = top.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
-    final maxV = ranked.isEmpty ? 1.0 : ranked.first.value;
-
-    final w = MediaQuery.of(context).size.width;
-    return ListView(padding: const EdgeInsets.fromLTRB(14, 14, 14, 100), children: [
-      LuxCard(
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [
-            const Icon(Icons.event, color: C.g),
-            const SizedBox(width: 10),
-            Expanded(child: Text(day == null ? 'كل الفترات' : dayKey(day!), style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16))),
-          ]),
-          Wrap(children: [
-            TextButton(
-              onPressed: () async {
-                final d = await showDatePicker(
-                  context: context,
-                  initialDate: day ?? DateTime.now(),
-                  firstDate: DateTime(2020),
-                  lastDate: DateTime.now().add(const Duration(days: 1)),
-                );
-                if (d != null) setState(() => day = d);
-              },
-              child: const Text('اختيار يوم'),
-            ),
-            TextButton(onPressed: () => setState(() => day = DateTime.now()), child: const Text('اليوم')),
-            TextButton(onPressed: () => setState(() => day = null), child: const Text('الكل')),
-          ]),
-        ]),
-      ),
-      GridView.count(
-        crossAxisCount: w > 760 ? 3 : 2,
-        shrinkWrap: true,
-        physics: const NeverScrollableScrollPhysics(),
-        crossAxisSpacing: 12,
-        mainAxisSpacing: 12,
-        childAspectRatio: w > 760 ? 2.8 : 1.7,
-        children: [
-          StatTile('إجمالي المبيعات', money(sales), Icons.payments_rounded, C.g2),
-          StatTile('عدد الطلبات', '${valid.length}', Icons.shopping_bag_rounded, C.gold),
-          StatTile('قيمة الأصناف', money(goods), Icons.restaurant_rounded, C.blue),
-          StatTile('رسوم التوصيل', money(delivery), Icons.delivery_dining_rounded, C.purple),
-          StatTile('طلبات غير مكتملة', '$unfinished', Icons.hourglass_bottom_rounded, C.orange),
-          StatTile('مستحق على الكباتن', money(cash), Icons.account_balance_wallet_rounded, C.red),
-        ],
-      ),
-      const SizedBox(height: 18),
-      const PageHead('الأكثر مبيعاً'),
-      if (ranked.isEmpty) const LuxCard(child: Empty('لا توجد بيانات', icon: Icons.bar_chart)),
-      for (final e in ranked.take(8))
-        LuxCard(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Row(children: [
-              Expanded(child: Text(e.key, style: const TextStyle(fontWeight: FontWeight.w800))),
-              Text(money(e.value), style: const TextStyle(color: C.g2, fontWeight: FontWeight.w900)),
-            ]),
-            const SizedBox(height: 6),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(99),
-              child: LinearProgressIndicator(value: e.value / maxV, minHeight: 8, color: C.gold, backgroundColor: C.g.withOpacity(.08)),
-            ),
-            const SizedBox(height: 4),
-            Text('الكمية: ${qtyText(topQty[e.key] ?? 0)}', style: const TextStyle(color: C.muted, fontSize: 11)),
-          ]),
-        ),
-    ]);
-  }
-}
-
-// ====================================================================
 //  الإعدادات (ملف صاحب المتجر + المتجر + الدخول + النسخ الاحتياطي)
 // ====================================================================
 
@@ -3939,7 +4649,7 @@ class _SettingsPageState extends State<SettingsPage> {
   late final phone = TextEditingController(text: s.settings.storePhone);
   late final address = TextEditingController(text: s.settings.storeAddress);
   late final user = TextEditingController(text: s.settings.username);
-  late final pass = TextEditingController(text: s.settings.password);
+  late final pass = TextEditingController();
 
   @override
   Widget build(BuildContext context) {
@@ -3999,10 +4709,12 @@ class _SettingsPageState extends State<SettingsPage> {
           LuxCard(
             child: Column(children: [
               inp('اسم المستخدم', user),
-              inp('كلمة المرور', pass, obscure: true),
+              inp('كلمة المرور الجديدة (اتركها فارغة للإبقاء على الحالية)', pass, obscure: true),
               LuxButton('تحديث بيانات الدخول', Icons.lock_outline, () {
-                if (user.text.trim().isEmpty || pass.text.isEmpty) return toast(context, 'أدخل اسم المستخدم وكلمة المرور');
+                if (user.text.trim().isEmpty) return toast(context, 'أدخل اسم المستخدم');
+                if (pass.text.isNotEmpty && pass.text.length < 6) return toast(context, 'كلمة المرور 6 أحرف على الأقل');
                 s.updateCredentials(user.text.trim(), pass.text);
+                pass.clear();
                 toast(context, 'تم تحديث بيانات الدخول');
               }),
             ]),
@@ -4040,6 +4752,29 @@ class _SettingsPageState extends State<SettingsPage> {
                     },
                     icon: const Icon(Icons.sync_rounded),
                     label: const Text('مزامنة كل البيانات الآن'),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(s.lastBackupAt == null ? 'النسخ الاحتياطي التلقائي: يعمل كل 20 دقيقة عند وجود تغييرات' : 'آخر نسخة احتياطية سحابية: ${dateText(s.lastBackupAt!)}',
+                      style: const TextStyle(color: C.muted, fontSize: 11)),
+                  const SizedBox(height: 6),
+                  OutlinedButton.icon(
+                    onPressed: () async {
+                      toast(context, 'جاري رفع النسخة الاحتياطية...');
+                      final ok = await s.backupNow();
+                      if (mounted) toast(context, ok ? 'تم حفظ نسخة احتياطية في السحابة ✓' : 'تعذّر الحفظ — حدّث قواعد Firebase');
+                    },
+                    icon: const Icon(Icons.cloud_upload_rounded),
+                    label: const Text('نسخ احتياطي إلى السحابة الآن'),
+                  ),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: () async {
+                      if (!await confirmDialog(context, 'استرجاع آخر نسخة من السحابة؟ ستُستبدل بيانات هذا الجهاز بها.', yes: 'استرجاع')) return;
+                      final err = await s.restoreFromCloud();
+                      if (mounted) toast(context, err ?? 'تم الاسترجاع بنجاح ✓');
+                    },
+                    icon: const Icon(Icons.cloud_download_rounded),
+                    label: const Text('استرجاع من السحابة'),
                   ),
                   const SizedBox(height: 8),
                   TextButton(
@@ -4112,8 +4847,10 @@ class _SettingsPageState extends State<SettingsPage> {
     toast(context, 'تم تفعيل الربط السحابي ✓');
   }
 
-  void _export() {
-    final txt = s.exportJson();
+  Future<void> _export() async {
+    toast(context, 'جاري تجهيز النسخة...');
+    final txt = await s.exportJsonFull();
+    if (!mounted) return;
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -4149,7 +4886,7 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _importFile() async {
     final t = await pickTextFile();
     if (t == null) return;
-    final ok = s.importJson(t);
+    final ok = await s.importJson(t);
     if (mounted) toast(context, ok ? 'تم الاستيراد بنجاح' : 'ملف غير صالح');
   }
 
@@ -4164,10 +4901,10 @@ class _SettingsPageState extends State<SettingsPage> {
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
           FilledButton(
-            onPressed: () {
-              final ok = s.importJson(c.text);
-              Navigator.pop(ctx);
-              toast(context, ok ? 'تم الاستيراد بنجاح' : 'نص غير صالح');
+            onPressed: () async {
+              final ok = await s.importJson(c.text);
+              if (ctx.mounted) Navigator.pop(ctx);
+              if (mounted) toast(context, ok ? 'تم الاستيراد بنجاح' : 'نص غير صالح');
             },
             child: const Text('استيراد'),
           ),
@@ -4197,6 +4934,55 @@ class _HomeShellState extends State<HomeShell> {
     super.initState();
     _store = context.read<AppStore>();
     _store.startCloud();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _store.settings.mustChange) _forcePasswordChange();
+    });
+  }
+
+  Future<void> _forcePasswordChange() async {
+    final u = TextEditingController(text: _store.settings.username);
+    final p1 = TextEditingController();
+    final p2 = TextEditingController();
+    String? err;
+    await showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => PopScope(
+        canPop: false,
+        child: StatefulBuilder(
+          builder: (ctx, set) => AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+            title: const Text('تأمين الحساب'),
+            content: SingleChildScrollView(
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                const Text('لحماية بياناتك اختر اسم مستخدم وكلمة مرور جديدة قبل المتابعة.', style: TextStyle(fontSize: 12, color: C.muted, height: 1.6)),
+                const SizedBox(height: 12),
+                TextField(controller: u, decoration: const InputDecoration(labelText: 'اسم المستخدم')),
+                const SizedBox(height: 10),
+                TextField(controller: p1, obscureText: true, decoration: const InputDecoration(labelText: 'كلمة المرور الجديدة (6 أحرف فأكثر)')),
+                const SizedBox(height: 10),
+                TextField(controller: p2, obscureText: true, decoration: const InputDecoration(labelText: 'تأكيد كلمة المرور')),
+                if (err != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text(err!, style: const TextStyle(color: C.red, fontWeight: FontWeight.w800, fontSize: 12))),
+              ]),
+            ),
+            actions: [
+              FilledButton(
+                onPressed: () {
+                  if (u.text.trim().isEmpty) return set(() => err = 'أدخل اسم المستخدم');
+                  if (p1.text.length < 6) return set(() => err = 'كلمة المرور 6 أحرف على الأقل');
+                  if (p1.text == '1234') return set(() => err = 'اختر كلمة مرور غير الافتراضية');
+                  if (p1.text != p2.text) return set(() => err = 'كلمتا المرور غير متطابقتين');
+                  _store.updateCredentials(u.text.trim(), p1.text);
+                  Navigator.pop(ctx);
+                },
+                child: const Text('حفظ ومتابعة'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (mounted) toast(context, 'تم تحديث بيانات الدخول ✓');
   }
 
   @override
@@ -4356,7 +5142,64 @@ Future<void> main() async {
   final raw = await loadPersisted();
   await cloud.load();
   final store = AppStore()..init(raw);
+  await store.migrateImages();
+  WidgetsBinding.instance.addObserver(_LifeObserver(store));
   runApp(StoreScope(notifier: store, child: const SaladBarApp()));
+}
+
+class _LifeObserver with WidgetsBindingObserver {
+  final AppStore store;
+  _LifeObserver(this.store);
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) store.flush();
+  }
+}
+
+class _SplashGate extends StatefulWidget {
+  final Widget child;
+  const _SplashGate({required this.child});
+  @override
+  State<_SplashGate> createState() => _SplashGateState();
+}
+
+class _SplashGateState extends State<_SplashGate> {
+  bool done = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(const Duration(milliseconds: 1300), () {
+      if (mounted) setState(() => done = true);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = context.watch<AppStore>();
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 400),
+      child: done
+          ? widget.child
+          : Scaffold(
+              key: const ValueKey('splash'),
+              body: Container(
+                decoration: const BoxDecoration(gradient: C.brandGradient),
+                child: Center(
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    Avatar(s.settings.logoPath, size: 110, fallback: Icons.eco_rounded),
+                    const SizedBox(height: 18),
+                    Text(s.settings.storeName, style: const TextStyle(color: Colors.white, fontSize: 30, fontWeight: FontWeight.w900)),
+                    const SizedBox(height: 6),
+                    const Text('مكرونة مخلوطة .. طعم يرضيك', style: TextStyle(color: C.gold, fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 28),
+                    const SizedBox(width: 26, height: 26, child: CircularProgressIndicator(strokeWidth: 2.5, color: C.gold)),
+                  ]),
+                ),
+              ),
+            ),
+    );
+  }
 }
 
 class SaladBarApp extends StatelessWidget {
@@ -4370,9 +5213,11 @@ class SaladBarApp extends StatelessWidget {
       theme: buildTheme(),
       scaffoldMessengerKey: messengerKey,
       builder: (context, child) => Directionality(textDirection: TextDirection.rtl, child: child!),
-      home: ListenableBuilder(
-        listenable: cloud,
-        builder: (context, _) => cloud.isCaptain ? const CaptainHome() : (s.loggedIn ? const HomeShell() : const LoginScreen()),
+      home: _SplashGate(
+        child: ListenableBuilder(
+          listenable: cloud,
+          builder: (context, _) => cloud.isCaptain ? const CaptainHome() : (s.loggedIn ? const HomeShell() : const LoginScreen()),
+        ),
       ),
     );
   }
@@ -4569,7 +5414,7 @@ class _CaptainHomeState extends State<CaptainHome> {
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(color: (due > 0 ? C.orange : C.g2).withOpacity(.1), borderRadius: BorderRadius.circular(14)),
           child: Column(children: [
-            Text(due > 0 ? 'المطلوب تحصيله من العميل' : '✅ مدفوع بالكامل — لا تحصّل أي مبلغ',
+            Text(due > 0 ? 'المطلوب تحصيله من العميل' : ('${o['method']}' == 'credit' ? '📒 آجل على حساب العميل — لا تحصّل أي مبلغ' : '✅ مدفوع بالكامل — لا تحصّل أي مبلغ'),
                 textAlign: TextAlign.center, style: TextStyle(color: due > 0 ? C.orange : C.g2, fontWeight: FontWeight.w900, fontSize: 13)),
             if (due > 0) ...[
               const SizedBox(height: 2),
