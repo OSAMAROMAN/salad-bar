@@ -86,6 +86,58 @@ jobs:
           print('signing patched in', p)
           PY
 
+      - name: App icon
+        run: |
+          python3 -m pip install pillow
+          python3 - <<'PY'
+          import os, sys, math
+          from PIL import Image, ImageDraw
+          S = 1024
+          img = Image.new('RGBA', (S, S), (0, 0, 0, 0))
+          d = ImageDraw.Draw(img)
+          # خلفية: مربع بزوايا دائرية بتدرج أخضر
+          bg = Image.new('RGBA', (S, S))
+          px = bg.load()
+          for y in range(S):
+              for x in range(S):
+                  t = (x * 0.4 + y * 0.6) / S
+                  r = int(13 + (36 - 13) * t); g = int(45 + (93 - 45) * t); b = int(36 + (71 - 36) * t)
+                  px[x, y] = (r, g, b, 255)
+          mask = Image.new('L', (S, S), 0)
+          ImageDraw.Draw(mask).rounded_rectangle((0, 0, S - 1, S - 1), radius=230, fill=255)
+          img.paste(bg, (0, 0), mask)
+          d = ImageDraw.Draw(img)
+          # حلقة ذهبية
+          d.ellipse((190, 190, 834, 834), outline=(212, 175, 55, 255), width=26)
+          # ورقة بيضاء (شكل ورقة نبات)
+          cx, cy = 512, 512
+          pts = []
+          for i in range(0, 181):
+              a = math.radians(i)
+              pts.append((cx + 175 * math.sin(a) * (1 - 0.0), cy - 250 * math.cos(a) * 0.98 + 0))
+          # شكل ورقة: قوسان متقابلان
+          leaf = []
+          for t in [i / 40 for i in range(41)]:
+              leaf.append((cx - 210 * math.sin(math.pi * t) * 0.9 + 0, cy + 250 - 500 * t))
+          left = [(cx - 215 * math.sin(math.pi * (i / 40)), cy + 250 - 500 * (i / 40)) for i in range(41)]
+          right = [(cx + 215 * math.sin(math.pi * (i / 40)), cy + 250 - 500 * (i / 40)) for i in range(40, -1, -1)]
+          d.polygon(left + right, fill=(255, 255, 255, 255))
+          # عرق الورقة
+          d.line((cx, cy + 250, cx, cy - 250), fill=(36, 93, 71, 255), width=14)
+          for k in range(1, 5):
+              y = cy + 250 - k * 100
+              d.line((cx, y, cx - 90, y - 60), fill=(36, 93, 71, 255), width=9)
+              d.line((cx, y, cx + 90, y - 60), fill=(36, 93, 71, 255), width=9)
+          out = 'android/app/src/main/res'
+          sizes = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
+          if out:
+              for k, v in sizes.items():
+                  dd = os.path.join(out, 'mipmap-' + k)
+                  os.makedirs(dd, exist_ok=True)
+                  img.resize((v, v), Image.LANCZOS).save(os.path.join(dd, 'ic_launcher.png'))
+          print('icons written')
+          PY
+
       - name: Force compileSdk 36 for plugins
         run: |
           mkdir -p ~/.gradle/init.d
@@ -100,7 +152,7 @@ jobs:
           GR
 
       - run: flutter pub get
-      - run: flutter build apk --release --build-number=${{ github.run_number }} --build-name=1.0.${{ github.run_number }}
+      - run: flutter build apk --release --build-number=${{ github.run_number }} --build-name=1.0.${{ github.run_number }} --dart-define=BUILD=${{ github.run_number }}
 
       - uses: actions/upload-artifact@v4
         with:
