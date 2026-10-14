@@ -12,19 +12,23 @@ import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
+import 'package:image/image.dart' as imglib;
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:share_plus/share_plus.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'cloud_config.dart';
 
 part 'p_extra.dart';
+part 'p_online.dart';
 
 /// رقم البناء (يُحقن من GitHub Actions)
 const int kBuild = int.fromEnvironment('BUILD', defaultValue: 0);
@@ -393,6 +397,10 @@ class AppSettings {
   String? logoPath, ownerImage;
   double loyaltyEarn, loyaltyValue; // earn: كل كم ريال = نقطة (0 = معطّل) ، value: قيمة النقطة بالريال
   String menuUrl;
+  bool onlineEnabled, onlineOpen;
+  String menuKey, onlineNote;
+  double onlineFee, minOrder;
+  List<Map<String, dynamic>> payMethods;
   AppSettings({
     this.username = 'admin',
     this.passHash = '',
@@ -407,7 +415,17 @@ class AppSettings {
     this.loyaltyEarn = 0,
     this.loyaltyValue = 50,
     this.menuUrl = '',
-  });
+    this.onlineEnabled = false,
+    this.onlineOpen = true,
+    this.menuKey = '',
+    this.onlineNote = '',
+    this.onlineFee = 500,
+    this.minOrder = 0,
+    List<Map<String, dynamic>>? payMethods,
+  }) : payMethods = payMethods ??
+            [
+              {'id': 'cod', 'title': 'الدفع عند الاستلام', 'kind': 'cod', 'info': '', 'needRef': false}
+            ];
   void setPassword(String pw) {
     passSalt = _newSalt();
     passHash = hashPw(pw, passSalt);
@@ -429,6 +447,13 @@ class AppSettings {
         'loyaltyEarn': loyaltyEarn,
         'loyaltyValue': loyaltyValue,
         'menuUrl': menuUrl,
+        'onlineEnabled': onlineEnabled,
+        'onlineOpen': onlineOpen,
+        'menuKey': menuKey,
+        'onlineNote': onlineNote,
+        'onlineFee': onlineFee,
+        'minOrder': minOrder,
+        'payMethods': payMethods,
       };
   factory AppSettings.fromJson(Map<String, dynamic> j) {
     final s = AppSettings(
@@ -442,6 +467,13 @@ class AppSettings {
       loyaltyEarn: _d(j['loyaltyEarn']),
       loyaltyValue: j['loyaltyValue'] == null ? 50 : _d(j['loyaltyValue']),
       menuUrl: j['menuUrl'] ?? '',
+      onlineEnabled: j['onlineEnabled'] ?? false,
+      onlineOpen: j['onlineOpen'] ?? true,
+      menuKey: j['menuKey'] ?? '',
+      onlineNote: j['onlineNote'] ?? '',
+      onlineFee: j['onlineFee'] == null ? 500 : _d(j['onlineFee']),
+      minOrder: _d(j['minOrder']),
+      payMethods: j['payMethods'] is List ? [for (final e in (j['payMethods'] as List)) Map<String, dynamic>.from(e as Map)] : null,
     );
     if ('${j['passHash'] ?? ''}'.isNotEmpty) {
       s.passHash = '${j['passHash']}';
@@ -567,6 +599,7 @@ class Order {
   double subtotal, delivery, discount, total;
   double goodsTotal, paidNow, goodsDue, captainCredit, pointsUsed;
   String notes, status, method, coupon, source;
+  String? webKey;
   DateTime? startAt, doneAt;
   String? proof;
   double? proofLat, proofLng;
@@ -595,6 +628,7 @@ class Order {
     this.proof,
     this.proofLat,
     this.proofLng,
+    this.webKey,
   });
 
   /// الكابتن لا يحصّل شيئاً من العميل (مدفوع بالكامل أو آجل)
@@ -628,6 +662,7 @@ class Order {
         'method': method,
         'coupon': coupon,
         'source': source,
+        'webKey': webKey,
         'startAt': startAt?.toIso8601String(),
         'doneAt': doneAt?.toIso8601String(),
         'proof': proof,
@@ -654,6 +689,7 @@ class Order {
         method: j['method'] ?? 'prepaid',
         coupon: j['coupon'] ?? '',
         source: j['source'] ?? 'app',
+        webKey: j['webKey'],
         startAt: _dt(j['startAt']),
         doneAt: _dt(j['doneAt']),
         proof: j['proof'],
@@ -1720,6 +1756,39 @@ class CloudService extends ChangeNotifier {
   // ---- القائمة الإلكترونية ----
   Future<bool> publishMenu(Map<String, dynamic> menu) async => _ok(await _db('PUT', 'menu', body: menu));
 
+  Future<bool> putMenuKey(String k) async => _ok(await _db('PUT', 'menuKey', body: k));
+
+  Future<bool> putMenuImg(String id, String dataUrl) async => _ok(await _db('PUT', 'menuImg/$id', body: dataUrl));
+
+  Future<List<Map<String, dynamic>>?> fetchPendingWeb() async {
+    final r = await _db('GET', 'publicOrders', q: {'orderBy': '"status"', 'equalTo': '"pending"'});
+    if (!_ok(r)) return null;
+    final j = jsonDecode(r!.body);
+    final out = <Map<String, dynamic>>[];
+    if (j is Map) {
+      j.forEach((k, v) {
+        if (v is Map) out.add({...Map<String, dynamic>.from(v), '_key': '$k'});
+      });
+    }
+    return out;
+  }
+
+  Future<bool> setPublic(String key, Map<String, dynamic> patch) async => _ok(await _db('PATCH', 'publicOrders/$key', body: patch));
+
+  Future<bool> putTrack(String key, Map<String, dynamic> data) async => _ok(await _db('PATCH', 'orderTrack/$key', body: data));
+
+  /// حذف طلبات القائمة الإلكترونية الأقدم من تاريخ معيّن (مع صفحة التتبع)
+  Future<void> cleanWebOld(DateTime before) async {
+    final r = await _db('GET', 'publicOrders', q: {'orderBy': '"createdAt"', 'endAt': '"${before.toUtc().toIso8601String()}"', 'limitToFirst': '50'});
+    if (!_ok(r)) return;
+    final j = jsonDecode(r!.body);
+    if (j is! Map) return;
+    for (final k in j.keys) {
+      await _db('DELETE', 'publicOrders/$k');
+      await _db('DELETE', 'orderTrack/$k');
+    }
+  }
+
   Future<List<Map<String, dynamic>>?> fetchPublicOrders() async {
     final r = await _db('GET', 'publicOrders');
     if (!_ok(r)) return null;
@@ -1887,6 +1956,14 @@ class AppStore extends ChangeNotifier {
   List<CustomerPayment> customerPayments = [];
   List<StockMove> stockMoves = [];
   List<DayClose> closes = [];
+  List<Map<String, dynamic>> webOrders = [];
+  final Set<String> _seenWeb = {};
+  bool _webInit = false;
+  Timer? _menuTimer;
+  String _menuHash = '';
+  String? _keySent;
+  final Map<String, String> _imgSig = {};
+  DateTime? menuPublishedAt;
   bool _captainsFixed = false;
   int _nP = 1, _nC = 1, _nCap = 1, _nO = 1;
 
@@ -1999,6 +2076,7 @@ class AppStore extends ChangeNotifier {
     _saveTimer = Timer(const Duration(milliseconds: 500), flush);
     notifyListeners();
     _scheduleStats();
+    _scheduleMenu();
   }
 
   void flush() {
@@ -2344,7 +2422,10 @@ class AppStore extends ChangeNotifier {
   }
 
   void _syncOrder(Order o) {
-    if (cloud.isOwner) _pushOrder(o);
+    if (cloud.isOwner) {
+      _pushOrder(o);
+      _pushWebStatus(o);
+    }
   }
 
   void _scheduleStats() {
@@ -2389,6 +2470,7 @@ class AppStore extends ChangeNotifier {
 
   Future<void> cleanupCloud() async {
     final now = DateTime.now();
+    if (settings.onlineEnabled) await cloud.cleanWebOld(now.subtract(const Duration(days: 3)));
     for (final c in captains.where((c) => c.login != null).toList()) {
       final ids = await cloud.listOrderIds(c.id);
       if (ids == null) continue;
@@ -2411,6 +2493,9 @@ class AppStore extends ChangeNotifier {
     Future.delayed(const Duration(seconds: 40), () {
       if (cloud.isOwner) backupNow();
     });
+    Future.delayed(const Duration(seconds: 12), () {
+      if (cloud.isOwner && settings.onlineEnabled) publishMenuNow(force: true);
+    });
     fullSync();
   }
 
@@ -2418,6 +2503,7 @@ class AppStore extends ChangeNotifier {
     _poll?.cancel();
     _poll = null;
     _backupTimer?.cancel();
+    _menuTimer?.cancel();
   }
 
   Future<void> pollCloud() async {
@@ -2455,9 +2541,256 @@ class AppStore extends ChangeNotifier {
         }
         await cloud.deleteInbox(cid, oid);
       }
+      if (settings.onlineEnabled) await refreshWeb();
     } finally {
       _polling = false;
     }
+  }
+
+  // ---- القائمة الإلكترونية (طلب العميل) ----
+  String _newKey() {
+    const ch = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    final r = Random.secure();
+    return String.fromCharCodes(List.generate(10, (_) => ch.codeUnitAt(r.nextInt(ch.length))));
+  }
+
+  String _linkBase(String param, String value) {
+    final base = settings.menuUrl.trim();
+    if (base.isEmpty) return '';
+    final db = kFbDbUrl.replaceAll(RegExp(r'/+$'), '');
+    return '$base${base.contains('?') ? '&' : '?'}db=${Uri.encodeComponent(db)}&$param=$value';
+  }
+
+  String get menuLink => settings.menuKey.isEmpty ? '' : _linkBase('k', settings.menuKey);
+  String trackLink(String key) => _linkBase('t', key);
+
+  Future<void> updateOnline({
+    bool? enabled,
+    bool? open,
+    String? url,
+    double? fee,
+    double? minOrder,
+    String? note,
+    List<Map<String, dynamic>>? pays,
+    bool publish = true,
+  }) async {
+    if (enabled != null) settings.onlineEnabled = enabled;
+    if (open != null) settings.onlineOpen = open;
+    if (url != null) settings.menuUrl = url.trim();
+    if (fee != null) settings.onlineFee = fee;
+    if (minOrder != null) settings.minOrder = minOrder;
+    if (note != null) settings.onlineNote = note.trim();
+    if (pays != null) settings.payMethods = pays;
+    if (settings.onlineEnabled && settings.menuKey.isEmpty) settings.menuKey = _newKey();
+    _save();
+    if (publish && cloud.isOwner) await publishMenuNow(force: true);
+  }
+
+  Future<void> rotateMenuKey() async {
+    settings.menuKey = _newKey();
+    _keySent = null;
+    _save();
+    if (cloud.isOwner) await publishMenuNow(force: true);
+  }
+
+  Map<String, dynamic> _menuJson() => {
+        'enabled': settings.onlineEnabled,
+        'open': settings.onlineOpen,
+        'store': settings.storeName,
+        'tagline': settings.storeAddress,
+        'phone': settings.storePhone,
+        'logo': (settings.logoPath ?? '').isNotEmpty,
+        'note': settings.onlineNote,
+        'minOrder': settings.minOrder,
+        'deliveryFee': settings.onlineFee,
+        'payments': [
+          for (final m in settings.payMethods)
+            {'id': m['id'], 'title': m['title'], 'kind': m['kind'], 'info': m['info'] ?? '', 'needRef': m['needRef'] == true}
+        ],
+        'items': [
+          for (final p in products.where((p) => p.active))
+            {'id': p.id, 'name': p.name, 'price': p.price, 'unit': p.unit, 'av': !p.track || p.stock > 0, 'img': (p.imagePath ?? '').isNotEmpty}
+        ],
+      };
+
+  void _scheduleMenu() {
+    if (!cloud.isOwner || !settings.onlineEnabled) return;
+    _menuTimer?.cancel();
+    _menuTimer = Timer(const Duration(seconds: 8), () => publishMenuNow());
+  }
+
+  Future<String?> _thumb(String path) async {
+    try {
+      Uint8List bytes;
+      if (path.startsWith('data:')) {
+        bytes = base64Decode(path.substring(path.indexOf(',') + 1));
+      } else if (path.startsWith('http')) {
+        return null;
+      } else {
+        bytes = await File(path).readAsBytes();
+      }
+      final out = await compute(_makeThumb, bytes);
+      return 'data:image/jpeg;base64,${base64Encode(out)}';
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _sendImg(String id, String? path) async {
+    if (path == null || path.isEmpty || _imgSig[id] == path) return;
+    final t = await _thumb(path);
+    if (t != null && await cloud.putMenuImg(id, t)) _imgSig[id] = path;
+  }
+
+  /// ينشر القائمة (والصور المصغّرة عند تغيّرها) للعملاء
+  Future<bool> publishMenuNow({bool force = false}) async {
+    if (!cloud.isOwner) return false;
+    if (settings.menuKey.isNotEmpty && _keySent != settings.menuKey) {
+      if (await cloud.putMenuKey(settings.menuKey)) _keySent = settings.menuKey;
+    }
+    final m = _menuJson();
+    final h = jsonEncode(m);
+    if (!force && h == _menuHash) return true;
+    if (settings.onlineEnabled) {
+      await _sendImg('logo', settings.logoPath);
+      for (final p in products.where((p) => p.active)) {
+        await _sendImg('p${p.id}', p.imagePath);
+      }
+    }
+    final ok = await cloud.publishMenu(m);
+    if (ok) {
+      _menuHash = h;
+      menuPublishedAt = DateTime.now();
+      notifyListeners();
+    }
+    return ok;
+  }
+
+  Future<void> refreshWeb() async {
+    final l = await cloud.fetchPendingWeb();
+    if (l == null) return;
+    final made = <String, Order>{for (final o in orders) if (o.webKey != null) o.webKey!: o};
+    final pending = <Map<String, dynamic>>[];
+    for (final w in l) {
+      final o = made['${w['_key']}'];
+      if (o != null) {
+        _pushWebStatus(o); // طلب أُنشئ لكن لم تُحدَّث حالته في السحابة
+      } else {
+        pending.add(w);
+      }
+    }
+    pending.sort((a, b) => '${a['createdAt']}'.compareTo('${b['createdAt']}'));
+    final fresh = pending.where((w) => !_seenWeb.contains('${w['_key']}')).toList();
+    for (final w in fresh) {
+      _seenWeb.add('${w['_key']}');
+    }
+    final changed = fresh.isNotEmpty || pending.length != webOrders.length;
+    webOrders = pending;
+    if (fresh.isNotEmpty) {
+      toastGlobal(_webInit ? '🛒 طلب جديد من القائمة الإلكترونية (${pending.length} بانتظار القبول)' : '🛒 لديك ${pending.length} طلب وارد من القائمة الإلكترونية');
+    }
+    _webInit = true;
+    if (changed) notifyListeners();
+  }
+
+  /// يحسب مجموع طلب وارد بالأسعار الحالية في متجرك
+  ({double sub, List<String> missing}) webSubtotal(Map<String, dynamic> w) {
+    var sub = 0.0;
+    final missing = <String>[];
+    for (final it in asMapList(w['items'])) {
+      final pr = product((it['pid'] as num?)?.toInt() ?? 0);
+      final q = _d(it['qty']);
+      if (pr == null) {
+        missing.add('${it['name'] ?? ''}');
+      } else {
+        sub += pr.price * q * unitFactor(pr.unit);
+      }
+    }
+    return (sub: sub, missing: missing);
+  }
+
+  /// يحوّل الطلب الوارد إلى طلب حقيقي في النظام
+  Future<({Order? order, String? error})> acceptWebOrder(Map<String, dynamic> w, {required int captainId, required double fee, required bool paidOk}) async {
+    final key = '${w['_key']}';
+    final cm = Map<String, dynamic>.from((w['customer'] as Map?) ?? {});
+    final pm = Map<String, dynamic>.from((w['payment'] as Map?) ?? {});
+    final phone = '${cm['phone'] ?? ''}';
+    final wn = waNumber(phone);
+    final lat = cm['lat'] is num ? (cm['lat'] as num).toDouble() : null;
+    final lng = cm['lng'] is num ? (cm['lng'] as num).toDouble() : null;
+    final items = <OrderItem>[];
+    final missing = <String>[];
+    for (final it in asMapList(w['items'])) {
+      final q = _d(it['qty']);
+      if (q <= 0) continue;
+      final pr = product((it['pid'] as num?)?.toInt() ?? 0);
+      if (pr == null) {
+        missing.add('${it['name'] ?? ''}');
+        continue;
+      }
+      if (pr.track && q > pr.stock) return (order: null, error: 'الكمية المطلوبة من ${pr.name} أكبر من المخزون (${qtyText(pr.stock)})');
+      items.add(OrderItem(productId: pr.id, name: pr.name, price: pr.price, cost: pr.cost, unit: pr.unit, qty: q));
+    }
+    if (items.isEmpty) return (order: null, error: 'لا توجد أصناف صالحة في هذا الطلب');
+    Customer? cu = wn.isEmpty ? null : customers.where((x) => waNumber(x.phone) == wn).firstOrNull;
+    if (cu == null) {
+      cu = Customer(id: 0, name: '${cm['name'] ?? 'عميل'}', phone: wn.isEmpty ? phone : wn, address: '${cm['address'] ?? ''}', lat: lat, lng: lng);
+    } else {
+      if (cu.address.isEmpty) cu.address = '${cm['address'] ?? ''}';
+      if (lat != null && lng != null && !cu.hasLoc) {
+        cu.lat = lat;
+        cu.lng = lng;
+      }
+    }
+    saveCustomer(cu);
+    final kind = '${pm['kind'] ?? 'cod'}';
+    final ref = '${pm['ref'] ?? ''}'.trim();
+    final notes = [
+      if ('${cm['notes'] ?? ''}'.trim().isNotEmpty) '${cm['notes']}'.trim(),
+      'طلب إلكتروني — ${pm['title'] ?? ''}${ref.isEmpty ? '' : ' (مرجع: $ref)'}',
+      if (missing.isNotEmpty) 'أصناف غير موجودة: ${missing.join('، ')}',
+    ].join(' | ');
+    final o = createOrder(
+      customerId: cu.id,
+      captainId: captainId,
+      items: items,
+      delivery: fee,
+      discount: 0,
+      notes: notes,
+      method: (kind != 'cod' && paidOk) ? 'prepaid' : 'cod',
+      paidNow: 0,
+    );
+    o.source = 'web';
+    o.webKey = key;
+    _save();
+    _pushWebStatus(o);
+    return (order: o, error: null);
+  }
+
+  Future<bool> rejectWebOrder(String key, String reason) async {
+    final a = await cloud.setPublic(key, {'status': 'rejected'});
+    if (!a) return false;
+    await cloud.putTrack(key, {'status': 'rejected', 'reason': reason, 'at': DateTime.now().toIso8601String()});
+    webOrders = webOrders.where((w) => '${w['_key']}' != key).toList();
+    notifyListeners();
+    return true;
+  }
+
+  void _pushWebStatus(Order o) {
+    final k = o.webKey;
+    if (k == null || !cloud.isOwner) return;
+    final cap = captain(o.captainId);
+    final st = switch (o.status) { 'new' => 'accepted', 'prep' => 'preparing', 'delivery' => 'delivering', 'done' => 'done', _ => 'cancelled' };
+    cloud.setPublic(k, {'status': st});
+    cloud.putTrack(k, {
+      'status': st,
+      'orderNo': o.id,
+      'total': o.total,
+      'delivery': o.delivery,
+      'captainName': cap?.name ?? '',
+      'captainPhone': st == 'delivering' ? (cap?.phone ?? '') : '',
+      'at': DateTime.now().toIso8601String(),
+    });
   }
 
   // ---- المخزون ----
@@ -4984,6 +5317,16 @@ class _SettingsPageState extends State<SettingsPage> {
               OutlinedButton.icon(onPressed: _import, icon: const Icon(Icons.download_rounded), label: const Text('لصق واستيراد نص')),
             ]),
           ),
+          const PageHead('القائمة الإلكترونية (طلب العميل)'),
+          LuxCard(
+            accent: st.settings.onlineEnabled ? C.g2 : C.muted,
+            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              Text(st.settings.onlineEnabled ? 'مفعّلة ✓ — العملاء يطلبون من الرابط أو QR' : 'غير مفعّلة. فعّلها ليطلب العملاء بأنفسهم من قائمة بالأصناف والأسعار.',
+                  style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13, height: 1.6)),
+              const SizedBox(height: 10),
+              LuxButton('إعدادات الطلب الإلكتروني و QR', Icons.qr_code_2_rounded, () => Navigator.push(context, MaterialPageRoute(builder: (_) => const OnlineSettingsPage()))),
+            ]),
+          ),
           const PageHead('الربط السحابي (تطبيق الكابتن)'),
           ListenableBuilder(
             listenable: cloud,
@@ -5286,6 +5629,12 @@ class _HomeShellState extends State<HomeShell> {
           ),
         ]),
         actions: [
+          if (s.settings.onlineEnabled)
+            IconButton(
+              tooltip: 'طلبات القائمة الإلكترونية',
+              icon: Badge(label: Text('${s.webOrders.length}'), isLabelVisible: s.webOrders.isNotEmpty, child: const Icon(Icons.shopping_basket_rounded)),
+              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const WebOrdersPage())),
+            ),
           GestureDetector(
             onTap: () => go(6),
             child: Padding(padding: const EdgeInsets.symmetric(horizontal: 4), child: Avatar(s.settings.ownerImage, size: 30)),
@@ -5397,6 +5746,13 @@ Future<void> main() async {
   await store.migrateImages();
   WidgetsBinding.instance.addObserver(_LifeObserver(store));
   runApp(StoreScope(notifier: store, child: const SaladBarApp()));
+}
+
+Uint8List _makeThumb(Uint8List b) {
+  final im = imglib.decodeImage(b);
+  if (im == null) return b;
+  final r = imglib.copyResize(imglib.bakeOrientation(im), width: 360);
+  return Uint8List.fromList(imglib.encodeJpg(r, quality: 72));
 }
 
 class _LifeObserver with WidgetsBindingObserver {
