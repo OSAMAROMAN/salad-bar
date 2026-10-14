@@ -13,6 +13,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
@@ -221,6 +222,114 @@ void copyText(BuildContext c, String text, String msg) {
 }
 
 // ---- الصور ----
+// ---- الموقع الجغرافي ----
+typedef LatLng = ({double lat, double lng});
+
+String mapLink(double lat, double lng) => 'https://www.google.com/maps?q=$lat,$lng';
+
+String _normDigits(String t) {
+  const ar = '٠١٢٣٤٥٦٧٨٩';
+  final sb = StringBuffer();
+  for (final ch in t.runes) {
+    final c = String.fromCharCode(ch);
+    final i = ar.indexOf(c);
+    sb.write(i >= 0 ? '$i' : (c == '٫' ? '.' : c));
+  }
+  return sb.toString();
+}
+
+/// يستخرج الإحداثيات من رابط خرائط جوجل أو من نص بصيغة "15.35, 44.20"
+LatLng? parseLatLng(String text) {
+  var t = _normDigits(text.trim());
+  try {
+    t = Uri.decodeFull(t);
+  } catch (_) {}
+  final pats = [
+    RegExp(r'@(-?\d{1,2}\.\d+),\s*(-?\d{1,3}\.\d+)'),
+    RegExp(r'[?&](?:q|ll|query|destination|center|daddr)=(-?\d{1,2}\.\d+)[,\s]+(-?\d{1,3}\.\d+)'),
+    RegExp(r'!3d(-?\d{1,2}\.\d+)!4d(-?\d{1,3}\.\d+)'),
+    RegExp(r'/place/(-?\d{1,2}\.\d+),\s*(-?\d{1,3}\.\d+)'),
+    RegExp(r'^\s*(-?\d{1,2}\.\d+)\s*[,،;\s]\s*(-?\d{1,3}\.\d+)\s*$'),
+  ];
+  for (final r in pats) {
+    final m = r.firstMatch(t);
+    if (m == null) continue;
+    final la = double.tryParse(m.group(1)!), ln = double.tryParse(m.group(2)!);
+    if (la != null && ln != null && la.abs() <= 90 && ln.abs() <= 180) return (lat: la, lng: ln);
+  }
+  return null;
+}
+
+/// يحلّ الروابط المختصرة (maps.app.goo.gl وغيرها) بتتبّع التحويلات
+Future<LatLng?> resolveLocation(String text) async {
+  final direct = parseLatLng(text);
+  if (direct != null) return direct;
+  final um = RegExp(r'https?://[^\s]+').firstMatch(text);
+  final first = um == null ? null : Uri.tryParse(um.group(0)!);
+  if (first == null) return null;
+  var url = first;
+  final client = http.Client();
+  try {
+    for (var i = 0; i < 6; i++) {
+      final p = parseLatLng(url.toString());
+      if (p != null) return p;
+      final req = http.Request('GET', url)..followRedirects = false;
+      final res = await client.send(req).timeout(const Duration(seconds: 12));
+      final loc = res.headers['location'];
+      if (res.statusCode >= 300 && res.statusCode < 400 && loc != null) {
+        url = url.resolve(loc);
+        continue;
+      }
+      final body = await res.stream.bytesToString();
+      final m = RegExp(r'@(-?\d{1,2}\.\d+),\s*(-?\d{1,3}\.\d+)').firstMatch(body);
+      if (m != null) return parseLatLng('@${m.group(1)},${m.group(2)}');
+      break;
+    }
+  } catch (_) {
+  } finally {
+    client.close();
+  }
+  return null;
+}
+
+/// موقع الجهاز الحالي (null عند الرفض أو الفشل)
+Future<LatLng?> getMyLocation(BuildContext c) async {
+  try {
+    if (!await Geolocator.isLocationServiceEnabled()) {
+      if (c.mounted) toast(c, 'شغّل خدمة الموقع (GPS) في الهاتف');
+      return null;
+    }
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) perm = await Geolocator.requestPermission();
+    if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) {
+      if (c.mounted) toast(c, 'اسمح للتطبيق بالوصول للموقع من إعدادات الهاتف');
+      return null;
+    }
+    final pos = await Geolocator.getCurrentPosition(locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, timeLimit: Duration(seconds: 20)));
+    return (lat: pos.latitude, lng: pos.longitude);
+  } catch (_) {
+    if (c.mounted) toast(c, 'تعذّر تحديد الموقع، حاول في مكان مفتوح');
+    return null;
+  }
+}
+
+/// يفتح خرائط جوجل للملاحة إلى الإحداثيات (أو يبحث بالعنوان)
+Future<void> openNavigation(BuildContext c, {double? lat, double? lng, String address = ''}) async {
+  final String url;
+  if (lat != null && lng != null) {
+    url = 'https://www.google.com/maps/dir/?api=1&destination=$lat,$lng&travelmode=driving';
+  } else if (address.trim().isNotEmpty) {
+    url = 'https://www.google.com/maps/search/?api=1&query=${Uri.encodeComponent(address)}';
+  } else {
+    return toast(c, 'لا يوجد موقع أو عنوان');
+  }
+  var ok = false;
+  try {
+    ok = await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+  } catch (_) {}
+  if (!ok && c.mounted) toast(c, 'تعذّر فتح الخرائط');
+}
+
 final Map<String, Uint8List> _imgCache = {};
 
 Uint8List? _decodeImg(String path) {
@@ -400,14 +509,18 @@ class Product {
 class Customer {
   int id;
   String name, phone, address, notes;
-  Customer({required this.id, required this.name, required this.phone, required this.address, this.notes = ''});
-  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'phone': phone, 'address': address, 'notes': notes};
+  double? lat, lng; // موقع العميل على الخريطة
+  Customer({required this.id, required this.name, required this.phone, required this.address, this.notes = '', this.lat, this.lng});
+  bool get hasLoc => lat != null && lng != null;
+  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'phone': phone, 'address': address, 'notes': notes, 'lat': lat, 'lng': lng};
   factory Customer.fromJson(Map<String, dynamic> j) => Customer(
         id: j['id'],
         name: j['name'],
         phone: j['phone'] ?? '',
         address: j['address'] ?? '',
         notes: j['notes'] ?? '',
+        lat: j['lat'] is num ? (j['lat'] as num).toDouble() : null,
+        lng: j['lng'] is num ? (j['lng'] as num).toDouble() : null,
       );
 }
 
@@ -1705,6 +1818,12 @@ class CloudService extends ChangeNotifier {
     return true;
   }
 
+  Future<bool> captainSendLocation(int oid, String status, double lat, double lng) async {
+    if (captainKey == null) return false;
+    return _ok(await _db('PUT', 'inbox/$captainKey/${oKey(oid)}',
+        body: {'status': status, 'at': DateTime.now().toIso8601String(), 'name': name ?? '', 'lat': lat, 'lng': lng}));
+  }
+
   Future<bool> submitPurchase(int pid, double actual, String note, String? receipt) async {
     if (captainKey == null) return false;
     return _ok(await _db('PUT', 'purchaseInbox/$captainKey/${pKey(pid)}', body: {
@@ -2073,6 +2192,13 @@ class AppStore extends ChangeNotifier {
 
   // ---- Customers ----
   void saveCustomer(Customer c) {
+    // بعد الحفظ تُحدَّث نسخ الطلبات الحديثة عند الكابتن (العنوان/الموقع)
+    Future.microtask(() {
+      if (!cloud.isOwner) return;
+      for (final o in orders.where((o) => o.customerId == c.id && _recent(o)).toList()) {
+        _syncOrder(o);
+      }
+    });
     if (c.id == 0) {
       c.id = _nC++;
       customers.add(c);
@@ -2185,6 +2311,8 @@ class AppStore extends ChangeNotifier {
       'customerPhone': c?.phone ?? '',
       'customerAddress': c?.address ?? '',
       'customerNotes': c?.notes ?? '',
+      'customerLat': c?.lat,
+      'customerLng': c?.lng,
       'items': [
         for (final i in o.items) {'name': i.name, 'qty': i.qty, 'unit': i.unit, 'price': i.price, 'total': i.lineTotal}
       ],
@@ -2313,6 +2441,17 @@ class AppStore extends ChangeNotifier {
         if (o != null && o.captainId == cid && (st == 'delivery' || st == 'done') && _rank(st) > _rank(o.status)) {
           changeStatus(o, st);
           toastGlobal('${captain(cid)?.name ?? 'الكابتن'}: الطلب #$oid ← ${statusLabel(st)}');
+        }
+        final la = m['lat'], ln = m['lng'];
+        if (o != null && o.captainId == cid && la is num && ln is num) {
+          final cu = customer(o.customerId);
+          if (cu != null) {
+            cu.lat = la.toDouble();
+            cu.lng = ln.toDouble();
+            _save();
+            _syncOrder(o);
+            toastGlobal('تم تحديث موقع ${cu.name} من الكابتن 📍');
+          }
         }
         await cloud.deleteInbox(cid, oid);
       }
@@ -2576,6 +2715,7 @@ String captainText(AppStore s, Order o) {
       'العميل: ${c?.name ?? '-'}\n'
       'هاتف العميل: ${c?.phone ?? '-'}\n'
       'العنوان: ${c?.address ?? '-'}\n'
+      '${c != null && c.hasLoc ? 'الموقع على الخريطة: ${mapLink(c.lat!, c.lng!)}\n' : ''}'
       'طريقة الدفع: ${paymentLabel(o.method)}\n'
       '$collect'
       'ملاحظات: ${o.notes.isEmpty ? 'لا توجد' : o.notes}\n'
@@ -3068,7 +3208,7 @@ class _OrderFormPageState extends State<OrderFormPage> {
                       value: customerId,
                       isExpanded: true,
                       decoration: const InputDecoration(labelText: 'العميل', prefixIcon: Icon(Icons.person_outline)),
-                      items: [for (final c in s.customers) DropdownMenuItem(value: c.id, child: Text('${c.name} — ${c.phone}', overflow: TextOverflow.ellipsis))],
+                      items: [for (final c in s.customers) DropdownMenuItem(value: c.id, child: Text('${c.name} — ${c.phone}${c.hasLoc ? '  📍' : ''}', overflow: TextOverflow.ellipsis))],
                       onChanged: (v) => setState(() => customerId = v),
                     ),
                   ),
@@ -4002,6 +4142,7 @@ class _CustomersPageState extends State<CustomersPage> {
             ]),
           ),
           Badge2('$count طلب', C.g2),
+          if (c.hasLoc) ...[const SizedBox(width: 6), Badge2('📍 موقع', C.blue)],
           if (s.customerDebt(c.id) > 0) ...[const SizedBox(width: 6), Badge2('عليه ${money(s.customerDebt(c.id))}', C.red)],
         ]),
         const SizedBox(height: 8),
@@ -4022,6 +4163,12 @@ class _CustomersPageState extends State<CustomersPage> {
             icon: const Icon(Icons.history_rounded, size: 18),
             label: const Text('السجل والحساب'),
           ),
+          if (c.hasLoc)
+            TextButton.icon(
+              onPressed: () => openNavigation(context, lat: c.lat, lng: c.lng, address: c.address),
+              icon: const Icon(Icons.navigation_rounded, size: 18, color: C.blue),
+              label: const Text('الموقع', style: TextStyle(color: C.blue)),
+            ),
           TextButton.icon(
             onPressed: () => sendWa(context, c.phone, 'مرحباً ${c.name} 🌿 من ${s.settings.storeName}'),
             icon: const Icon(Icons.chat_rounded, size: 18, color: C.wa),
@@ -4069,6 +4216,106 @@ class _CustomerFormState extends State<_CustomerForm> {
   late final phone = TextEditingController(text: widget.customer?.phone ?? '');
   late final address = TextEditingController(text: widget.customer?.address ?? '');
   late final notes = TextEditingController(text: widget.customer?.notes ?? '');
+  final locCtrl = TextEditingController();
+  late double? lat = widget.customer?.lat;
+  late double? lng = widget.customer?.lng;
+  bool busy = false;
+
+  Future<void> _resolve() async {
+    if (locCtrl.text.trim().isEmpty) return;
+    setState(() => busy = true);
+    final r = await resolveLocation(locCtrl.text);
+    if (!mounted) return;
+    setState(() {
+      busy = false;
+      if (r != null) {
+        lat = r.lat;
+        lng = r.lng;
+      }
+    });
+    toast(context, r == null ? 'تعذّر استخراج الموقع. استخدم رابط "مشاركة الموقع" الكامل أو الصق الإحداثيات' : 'تم تحديد الموقع ✓');
+  }
+
+  Future<void> _here() async {
+    setState(() => busy = true);
+    final r = await getMyLocation(context);
+    if (!mounted) return;
+    setState(() {
+      busy = false;
+      if (r != null) {
+        lat = r.lat;
+        lng = r.lng;
+      }
+    });
+    if (r != null) toast(context, 'تم أخذ موقع هذا الجهاز ✓');
+  }
+
+  Widget _locBox() => Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(color: const Color(0xFFFBFDFB), borderRadius: BorderRadius.circular(18), border: Border.all(color: C.line)),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Row(children: [
+            Icon(Icons.location_on_rounded, color: lat == null ? C.muted : C.g2),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(lat == null ? 'لم يُحدَّد موقع على الخريطة' : 'تم تحديد الموقع ✓  ${lat!.toStringAsFixed(5)}, ${lng!.toStringAsFixed(5)}',
+                  style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13, color: lat == null ? C.muted : C.g2)),
+            ),
+          ]),
+          const SizedBox(height: 10),
+          TextField(
+            controller: locCtrl,
+            keyboardType: TextInputType.url,
+            decoration: InputDecoration(
+              labelText: 'الصق رابط الموقع أو الإحداثيات',
+              hintText: 'https://maps.app.goo.gl/... أو 15.3547, 44.2067',
+              suffixIcon: busy
+                  ? const Padding(padding: EdgeInsets.all(12), child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)))
+                  : IconButton(icon: const Icon(Icons.check_circle_rounded, color: C.g2), onPressed: _resolve),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(spacing: 6, runSpacing: 4, children: [
+            OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8)),
+              onPressed: busy ? null : _here,
+              icon: const Icon(Icons.my_location_rounded, size: 18),
+              label: const Text('موقع هذا الجهاز', style: TextStyle(fontSize: 12)),
+            ),
+            OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8)),
+              onPressed: () => openNavigation(context, address: address.text),
+              icon: const Icon(Icons.search_rounded, size: 18),
+              label: const Text('بحث بالعنوان', style: TextStyle(fontSize: 12)),
+            ),
+            OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8)),
+              onPressed: () => sendWa(context, phone.text, 'مرحباً ${name.text.trim()} 🌿\nلتسهيل وصول الكابتن إليك، أرسل لنا موقعك من واتساب: اضغط 📎 ثم "الموقع" ثم "إرسال موقعك الحالي". شكراً لك.'),
+              icon: const Icon(Icons.chat_rounded, size: 18, color: C.wa),
+              label: const Text('اطلب الموقع من العميل', style: TextStyle(fontSize: 12)),
+            ),
+            if (lat != null)
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8)),
+                onPressed: () => openNavigation(context, lat: lat, lng: lng),
+                icon: const Icon(Icons.navigation_rounded, size: 18, color: C.blue),
+                label: const Text('فتح', style: TextStyle(fontSize: 12)),
+              ),
+            if (lat != null)
+              TextButton(
+                onPressed: () => setState(() {
+                  lat = null;
+                  lng = null;
+                }),
+                child: const Text('مسح الموقع', style: TextStyle(color: C.red, fontSize: 12)),
+              ),
+          ]),
+          const SizedBox(height: 6),
+          const Text('الأسهل: اطلب من العميل إرسال موقعه في واتساب، ثم اضغط مطولاً على الرسالة ← نسخ، والصق الرابط هنا.',
+              style: TextStyle(color: C.muted, fontSize: 11, height: 1.5)),
+        ]),
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -4081,9 +4328,12 @@ class _CustomerFormState extends State<_CustomerForm> {
         inp('الاسم', name, required: true),
         inp('رقم الهاتف (مع رمز الدولة)', phone, type: TextInputType.phone, required: true, hint: '9677xxxxxxxx'),
         inp('العنوان', address, lines: 2),
+        _locBox(),
         inp('ملاحظات', notes, lines: 2),
-        LuxButton('حفظ', Icons.save_rounded, () {
+        LuxButton('حفظ', Icons.save_rounded, () async {
           if (!form.currentState!.validate()) return;
+          if (locCtrl.text.trim().isNotEmpty && lat == null) await _resolve();
+          if (!mounted) return;
           final wn = waNumber(phone.text);
           if (wn.isEmpty) return toast(context, 'رقم الهاتف غير صالح');
           final dup = context.read<AppStore>().customers.where((x) => x.id != (widget.customer?.id ?? 0) && waNumber(x.phone) == wn).toList();
@@ -4093,6 +4343,8 @@ class _CustomerFormState extends State<_CustomerForm> {
           c.phone = phone.text.trim();
           c.address = address.text.trim();
           c.notes = notes.text.trim();
+          c.lat = lat;
+          c.lng = lng;
           context.read<AppStore>().saveCustomer(c);
           widget.onSaved?.call(c.id);
           Navigator.pop(context);
@@ -5281,6 +5533,28 @@ class _CaptainHomeState extends State<CaptainHome> {
     });
   }
 
+  /// الكابتن عند باب العميل: يحفظ موقعه الحالي كموقع للعميل
+  Future<void> _saveLoc(Map<String, dynamic> o) async {
+    if (busy) return;
+    if (!await confirmDialog(context, 'هل أنت الآن عند العميل؟ سيُحفظ موقعك الحالي كموقع لهذا العميل ليستفيد منه الطلب القادم.', yes: 'حفظ الموقع')) return;
+    setState(() => busy = true);
+    final p = await getMyLocation(context);
+    if (p == null) {
+      if (mounted) setState(() => busy = false);
+      return;
+    }
+    final ok = await cloud.captainSendLocation(_d(o['id']).toInt(), '${o['status']}', p.lat, p.lng);
+    if (!mounted) return;
+    setState(() {
+      busy = false;
+      if (ok) {
+        o['customerLat'] = p.lat;
+        o['customerLng'] = p.lng;
+      }
+    });
+    toast(context, ok ? 'تم حفظ موقع العميل ✓' : 'تعذّر الإرسال — تحقق من الاتصال');
+  }
+
   bool _isActive(Map<String, dynamic> o) {
     final st = '${o['status']}';
     return st == 'new' || st == 'prep' || st == 'delivery';
@@ -5382,6 +5656,9 @@ class _CaptainHomeState extends State<CaptainHome> {
     final addr = '${o['customerAddress'] ?? ''}';
     final notes = '${o['notes'] ?? ''}';
     final id = _d(o['id']).toInt();
+    final lat = o['customerLat'] is num ? (o['customerLat'] as num).toDouble() : null;
+    final lng = o['customerLng'] is num ? (o['customerLng'] as num).toDouble() : null;
+    final hasLoc = lat != null && lng != null;
     final date = DateTime.tryParse('${o['date']}');
     return LuxCard(
       accent: statusColor(st),
@@ -5394,7 +5671,7 @@ class _CaptainHomeState extends State<CaptainHome> {
         ]),
         const SizedBox(height: 6),
         if (phone.isNotEmpty) _line(Icons.phone_rounded, phone),
-        _line(Icons.location_on_rounded, addr.isEmpty ? 'لا يوجد عنوان' : addr),
+        _line(Icons.location_on_rounded, '${addr.isEmpty ? 'لا يوجد عنوان' : addr}${hasLoc ? '   📍 موقع دقيق' : ''}'),
         if (date != null) _line(Icons.schedule_rounded, dateText(date)),
         if (items.isNotEmpty) ...[
           const SizedBox(height: 6),
@@ -5429,7 +5706,8 @@ class _CaptainHomeState extends State<CaptainHome> {
         const Divider(height: 18),
         Wrap(children: [
           if (phone.isNotEmpty) TextButton.icon(onPressed: () => callPhone(context, phone), icon: const Icon(Icons.call_rounded, size: 18, color: C.blue), label: const Text('اتصال', style: TextStyle(color: C.blue))),
-          TextButton.icon(onPressed: () => openMap(context, addr), icon: const Icon(Icons.map_rounded, size: 18, color: C.purple), label: const Text('الخريطة', style: TextStyle(color: C.purple))),
+          TextButton.icon(onPressed: () => openNavigation(context, lat: lat, lng: lng, address: addr), icon: Icon(hasLoc ? Icons.navigation_rounded : Icons.map_rounded, size: 18, color: C.purple), label: Text(hasLoc ? 'ملاحة للموقع' : 'الخريطة', style: const TextStyle(color: C.purple))),
+          if (st == 'new' || st == 'prep' || st == 'delivery') TextButton.icon(onPressed: () => _saveLoc(o), icon: const Icon(Icons.pin_drop_rounded, size: 18, color: C.orange), label: const Text('حفظ موقع العميل', style: TextStyle(color: C.orange))),
           if (phone.isNotEmpty) TextButton.icon(onPressed: () => sendWa(context, phone, 'مرحباً ${o['customerName'] ?? ''} 🌿 أنا الكابتن ${cloud.name ?? ''} من ${o['store'] ?? 'المتجر'}، في الطريق إليك بطلبك #$id.'), icon: const Icon(Icons.chat_rounded, size: 18, color: C.wa), label: const Text('واتساب', style: TextStyle(color: C.wa))),
         ]),
         if (st == 'new' || st == 'prep') ...[
